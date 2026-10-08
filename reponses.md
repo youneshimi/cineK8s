@@ -493,3 +493,183 @@ Un `0/1` temporaire au démarrage est normal. La startupProbe laisse environ 60 
 Avec `imagePullPolicy: Always`, le runtime contacterait le registre à chaque démarrage du conteneur pour résoudre le tag de l'image. Nos images ont été construites localement et chargées dans Minikube, sans être publiées sur Docker Hub sous ces noms. Le démarrage échouerait donc avec `ErrImagePull`, puis `ImagePullBackOff`, même si les images sont présentes sur le nœud.
 
 `IfNotPresent` permet d'utiliser directement les images locales. `Always` ne signifie pas forcément retélécharger toutes les couches : si la résolution auprès du registre réussit, les couches déjà en cache peuvent être réutilisées. Voir la [documentation Kubernetes sur les images](https://kubernetes.io/docs/concepts/containers/images/#image-pull-policy).
+
+## Partie 5 — Exposer avec un Ingress
+
+### 5.1 — Activation du contrôleur Ingress
+
+Commandes exécutées :
+
+```powershell
+minikube addons enable ingress
+kubectl --context minikube wait -n ingress-nginx --for=condition=Ready pod -l app.kubernetes.io/component=controller --timeout=180s
+kubectl --context minikube get pods -n ingress-nginx
+kubectl --context minikube get ingressclass
+```
+
+Le module ingress a été activé. Le contrôleur utilise l'image `registry.k8s.io/ingress-nginx/controller:v1.15.1`.
+
+Sorties observées :
+
+```text
+pod/ingress-nginx-controller-d7cd8c989-bdz8c condition met
+
+NAME                                       READY   STATUS      RESTARTS   AGE
+ingress-nginx-admission-create-mjxr9       0/1     Completed   0          81s
+ingress-nginx-admission-patch-pdv8m        0/1     Completed   0          81s
+ingress-nginx-controller-d7cd8c989-bdz8c   1/1     Running     0          81s
+
+NAME              CONTROLLER             PARAMETERS   AGE
+nginx (default)   k8s.io/ingress-nginx   <none>       86s
+```
+
+Les deux Pods d'admission ont terminé leur travail. Le contrôleur est prêt et la classe à utiliser dans l'Ingress est `nginx`.
+
+#### Accès local sous Windows
+
+Le port 80 en IPv4 est déjà utilisé par Docker Desktop. J'ai donc utilisé l'adresse locale IPv6 `::1`, dont le port 80 était libre, pour conserver l'URL `http://cinema.local`.
+
+Dans le fichier `C:\Windows\System32\drivers\etc\hosts`, ouvert avec les droits administrateur, j'ai ajouté :
+
+```text
+::1 cinema.local
+```
+
+Un terminal reste ouvert avec cette redirection vers le contrôleur Ingress :
+
+```powershell
+kubectl --context minikube port-forward -n ingress-nginx svc/ingress-nginx-controller --address ::1 80:80
+```
+
+```text
+Forwarding from [::1]:80 -> 80
+Handling connection for 80
+```
+
+L'option `--address` permet de choisir l'adresse d'écoute locale du port-forward. Voir la [documentation kubectl](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_port-forward/).
+
+Avant de créer les règles de routage, j'ai testé dans un deuxième terminal :
+
+```powershell
+curl.exe -6 --noproxy "*" --max-time 10 -sS -o NUL -w "%{http_code}\n" http://cinema.local/
+```
+
+```text
+404
+```
+
+Ce résultat confirme que le contrôleur est accessible. À ce stade, aucune règle Ingress n'est encore créée pour l'application.
+
+### 5.2 — Création des règles Ingress
+
+Le fichier `40-ingress.yaml` utilise l'API `networking.k8s.io/v1`, la classe `nginx` et l'hôte `cinema.local`. Les deux chemins utilisent `pathType: Prefix` et pointent vers le port nommé `http` des Services.
+
+Commandes exécutées :
+
+```powershell
+kubectl --context minikube apply -f k8s/40-ingress.yaml
+kubectl --context minikube describe ingress cinema -n cinema-exam
+```
+
+Sortie observée :
+
+```text
+Name:             cinema
+Labels:           <none>
+Namespace:        cinema-exam
+Address:          192.168.49.2
+Ingress Class:    nginx
+Default backend:  <default>
+Rules:
+  Host          Path  Backends
+  ----          ----  --------
+  cinema.local
+                /api/movies    movie:http (10.244.0.4:8080,10.244.0.3:8080)
+                /api/tickets   ticket:http (10.244.0.5:8080,10.244.0.6:8080)
+Annotations:    <none>
+Events:
+  Type    Reason  Age                From                      Message
+  ----    ------  ----               ----                      -------
+  Normal  Sync    59s (x2 over 91s)  nginx-ingress-controller  Scheduled for sync
+```
+
+Les deux Services sont associés aux bonnes routes, avec deux Pods disponibles pour chacun. L'adresse affichée est celle du nœud Minikube ; depuis Windows, l'accès local passe par le port-forward configuré en 5.1.
+
+Une vérification HTTP confirme que `/api/movies` et `/api/movies/1` répondent tous les deux en HTTP 200. Le deuxième appel retourne bien le film `Pod Fiction`, ce qui vérifie aussi le routage d'un sous-chemin.
+
+### 5.3 — Tests via cinema.local
+
+Le port-forward du contrôleur Ingress reste ouvert pendant les tests.
+
+Liste des films :
+
+```powershell
+(curl.exe -6 --noproxy "*" -sS http://cinema.local/api/movies | ConvertFrom-Json) | Select-Object -ExpandProperty title
+```
+
+```text
+Pod Fiction
+Le Seigneur des Pods
+Docker Wars
+Rollback to the Future
+```
+
+Réservation de dix places pour le film 3 :
+
+```powershell
+$body = '{"movieId":3,"seats":10}'
+(Invoke-WebRequest -UseBasicParsing -Method Post -Uri http://cinema.local/api/tickets -ContentType "application/json" -Body $body).Content
+```
+
+```json
+{"id":2,"movieId":3,"movieTitle":"Docker Wars","seats":10,"total":90.00,"createdAt":"2026-10-08T11:50:25.075101329Z"}
+```
+
+Le total est correct : 10 places à 9,00 € donnent 90,00 €.
+
+Six appels à whoami :
+
+```powershell
+1..6 | ForEach-Object {
+    (curl.exe -6 --noproxy "*" -sS http://cinema.local/api/movies/whoami | ConvertFrom-Json).hostname
+}
+```
+
+```text
+movie-59684459f4-tm79l
+movie-59684459f4-xntzw
+movie-59684459f4-tm79l
+movie-59684459f4-xntzw
+movie-59684459f4-tm79l
+movie-59684459f4-xntzw
+```
+
+Test d'Actuator via l'Ingress :
+
+```powershell
+curl.exe -6 --noproxy "*" -sS -o NUL -w "%{http_code}\n" http://cinema.local/actuator/health
+```
+
+```text
+404
+```
+
+### Q5.1 — Répartition des appels
+
+Deux Pods movie distincts ont répondu : `movie-59684459f4-tm79l` et `movie-59684459f4-xntzw`, avec trois réponses chacun dans cette boucle.
+
+Le Service `movie` regroupe ces Pods grâce au sélecteur `app: movie` et constitue le backend déclaré dans l'Ingress. Lors d'un accès par son ClusterIP, le trafic du Service est réparti vers ses Pods prêts.
+
+Pour les appels HTTP passant ici par l'Ingress, le contrôleur NGINX utilise par défaut les adresses des Pods derrière ce Service et répartit directement les requêtes entre elles. Ce fonctionnement est décrit dans la [documentation Ingress-NGINX](https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#service-upstream).
+
+### Q5.2 — Chemin Exact
+
+Avec `pathType: Exact` sur `/api/movies`, seul ce chemin exact correspondrait à la règle. `/api/movies/1` ne correspondrait plus et, avec nos autres règles, recevrait un HTTP 404 du backend par défaut.
+
+`Prefix` permet de router aussi les sous-chemins, comme `/api/movies/1` et `/api/movies/whoami`. Voir la [documentation Kubernetes sur les types de chemins](https://kubernetes.io/docs/concepts/services-networking/ingress/#path-types).
+
+### Q5.3 — Actuator via l'Ingress
+
+J'obtiens un HTTP 404 pour `/actuator/health`. L'Ingress ne déclare que les routes `/api/movies` et `/api/tickets`, donc ce chemin ne correspond à aucune règle.
+
+C'est souhaitable ici : les informations de santé restent accessibles aux probes Kubernetes à l'intérieur du cluster, sans être exposées par l'URL de l'application. Le 404 de l'Ingress ne signifie pas que les services sont en panne : leurs Pods sont prêts et les appels aux API fonctionnent.
