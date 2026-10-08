@@ -13,10 +13,24 @@ spec:
       labels:
         app: movie
     spec:
+      volumes:
+        - name: tmp
+          emptyDir: {}
       containers:
         - name: movie
           image: movie-service:1.0.0
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           ports:
             - name: http
               containerPort: 8080

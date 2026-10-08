@@ -1104,3 +1104,61 @@ Après la suppression de `movie-7f49587d96-f47xd`, un nouveau Pod, `movie-7f4958
 Le ReplicaSet géré par le Deployment maintient les deux réplicas souhaités : il crée un remplaçant lorsqu'un Pod manque.
 Avec un Pod nu sans contrôleur, sa suppression ne déclencherait aucune recréation ; je perdrais aussi la gestion des réplicas et des mises à jour progressives offerte par le Deployment.
 La politique de redémarrage peut relancer un conteneur dans un Pod existant, mais elle ne recrée pas un Pod supprimé. Voir les documentations Kubernetes sur les [ReplicaSets](https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/) et le [cycle de vie des Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/).
+
+## Bonus — Durcir et fiabiliser
+
+### B1 — Sécurité du conteneur movie
+
+Dans `k8s/20-movie.yaml`, le `securityContext` du conteneur movie impose `runAsNonRoot: true` et `runAsUser: 10001`. L'UID correspond à l'utilisateur spring déjà présent dans l'image.
+
+`allowPrivilegeEscalation: false` interdit au processus de gagner des privilèges supplémentaires, `capabilities.drop: [ALL]` retire les capabilities Linux et `readOnlyRootFilesystem: true` rend le système de fichiers racine du conteneur non modifiable.
+
+J'ai aussi ajouté un volume `emptyDir` au niveau du Pod, monté sur `/tmp` dans le conteneur. Tomcat dispose ainsi d'un emplacement temporaire accessible en écriture malgré la racine en lecture seule. Ce volume est propre à chaque Pod et ses données sont supprimées avec celui-ci ; il ne sert pas à conserver des réservations. Voir les documentations Kubernetes sur le [securityContext](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/) et les [volumes emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir).
+
+#### Vérifications de B1
+
+J'ai appliqué le manifeste et attendu la fin du déploiement :
+
+```powershell
+kubectl --context minikube apply -f k8s/20-movie.yaml
+kubectl --context minikube rollout status deployment/movie -n cinema-exam --timeout=180s
+kubectl --context minikube get pods -n cinema-exam
+```
+
+```text
+deployment.apps/movie configured
+service/movie unchanged
+deployment "movie" successfully rolled out
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-75587c7dff-jf7js    1/1     Running   0          10s
+movie-75587c7dff-w9g72    1/1     Running   0          6s
+ticket-66d95c98b6-djfpb   1/1     Running   0          64m
+ticket-66d95c98b6-lrtwv   1/1     Running   0          64m
+```
+
+Contrôle de l'utilisateur et tentative d'écriture à la racine :
+
+```powershell
+kubectl --context minikube exec -n cinema-exam deploy/movie -- id
+kubectl --context minikube exec -n cinema-exam deploy/movie -- touch /test
+```
+
+```text
+uid=10001(spring) gid=101(spring) groups=101(spring)
+touch: cannot touch '/test': Read-only file system
+command terminated with exit code 1
+```
+
+Le code de sortie 1 est attendu pour ce test : l'écriture de `/test` est refusée car la racine est en lecture seule. Les Pods restent prêts, sans redémarrage.
+
+Une vérification complémentaire des deux Pods confirme tous les champs du `securityContext` ainsi que le volume `emptyDir` monté sur `/tmp`. L'API reste accessible via l'Ingress :
+
+```powershell
+curl.exe -6 --noproxy "*" --max-time 10 -sS -o NUL -w "%{http_code}\n" http://cinema.local/api/movies
+curl.exe -6 --noproxy "*" --max-time 10 -sS http://cinema.local/api/movies/whoami
+```
+
+```text
+200
+{"hostname":"movie-75587c7dff-jf7js","environment":"production"}
+```
