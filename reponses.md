@@ -172,3 +172,110 @@ Spring Boot utilise sa configuration externe : la variable d'environnement `SERV
 La liveness reste `UP` parce que ticket-service fonctionne encore : la panne concerne son service distant movie. Sa readiness passe à `DOWN` parce qu'il ne peut plus valider de nouvelles réservations.
 
 C'est le comportement voulu : dans Kubernetes, cette panne retirera le Pod du trafic du Service, sans déclencher un redémarrage de ticket-service qui ne réparerait pas movie-service.
+
+## Partie 3 — Conteneuriser
+
+### 3.1 — Construction des images
+
+Les deux Dockerfiles utilisent Maven avec un JDK 21 pour compiler, puis un JRE 21 Alpine pour exécuter le JAR. Les tests ont déjà été exécutés en partie 2 ; le build Docker utilise `-DskipTests`.
+
+Le port est fixé à 8080 dans les images avec `ENV SERVER_PORT=8080`, pour utiliser les ports du README avec les fichiers de configuration fournis.
+
+Commandes de construction :
+
+```powershell
+docker build -t movie-service:1.0.0 ./movie-service
+docker build -t ticket-service:1.0.0 ./ticket-service
+```
+
+Les deux images ont été construites :
+
+| Image | Taille affichée par Docker |
+|---|---:|
+| movie-service:1.0.0 | 331 MB |
+| ticket-service:1.0.0 | 331 MB |
+
+La somme des couches indiquées par `docker image history` est d'environ 236 MB par image. Le stockage containerd conserve les couches compressées et décompressées, ce qui explique la taille affichée plus élevée : [documentation Docker](https://docs.docker.com/engine/storage/containerd/#disk-space-usage).
+
+Vérification de l'utilisateur de chaque image :
+
+```powershell
+docker run --rm --entrypoint id movie-service:1.0.0
+```
+
+```text
+uid=10001(spring) gid=101(spring) groups=101(spring)
+```
+
+```powershell
+docker run --rm --entrypoint id ticket-service:1.0.0
+```
+
+```text
+uid=10001(spring) gid=101(spring) groups=101(spring)
+```
+
+### 3.2 — Test avec Docker Compose
+
+Commandes exécutées :
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+État observé :
+
+```text
+NAME               IMAGE                  COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+cinek8s-movie-1    movie-service:1.0.0    "java -XX:MaxRAMPerc…"   movie     10 seconds ago   Up 10 seconds (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+cinek8s-ticket-1   ticket-service:1.0.0   "java -XX:MaxRAMPerc…"   ticket    10 seconds ago   Up 5 seconds              0.0.0.0:8082->8080/tcp, [::]:8082->8080/tcp
+```
+
+Movie reçoit `MOVIE_ENVIRONMENT=compose`. Ticket reçoit `MOVIE_URL=http://movie:8080` et démarre après le passage du healthcheck de movie à `healthy`.
+
+```powershell
+curl.exe -s http://localhost:8080/api/movies/whoami
+```
+
+```json
+{"environment":"compose","hostname":"b5b4727199e5"}
+```
+
+Création d'une réservation :
+
+```powershell
+$body = '{"movieId":1,"seats":2}'
+(Invoke-WebRequest -UseBasicParsing -Method Post -Uri http://localhost:8082/api/tickets -ContentType "application/json" -Body $body).Content
+```
+
+Réponse reçue, puis retrouvée avec `GET /api/tickets` :
+
+```json
+{
+  "id": 1,
+  "movieId": 1,
+  "movieTitle": "Pod Fiction",
+  "seats": 2,
+  "total": 21.00,
+  "createdAt": "2026-10-08T10:49:25.175059063Z"
+}
+```
+
+La readiness de ticket répond en HTTP 200 avec `status: UP`, `movie: UP` et `readinessState: UP`.
+
+### Q3.1 — Cache des couches Docker
+
+Copier `pom.xml` avant `src/` permet de mettre en cache le téléchargement des dépendances Maven. Si seule une ligne de Java change, la copie des sources et la compilation sont refaites, mais la couche de téléchargement des dépendances peut être réutilisée puisque le `pom.xml` n'a pas changé.
+
+### Q3.2 — Mémoire de la JVM
+
+`-XX:MaxRAMPercentage=75` adapte la taille maximale du heap à la mémoire disponible pour la JVM, en tenant compte de la limite du conteneur. Cela laisse une marge pour les autres besoins de mémoire de la JVM, comme le metaspace et les piles des threads.
+
+Avec `-Xmx512m`, la taille maximale du heap est fixée à 512 MiB, même si la limite du conteneur change : pour un conteneur limité à 512 MiB, les besoins de mémoire hors heap peuvent alors provoquer un dépassement de la limite.
+
+### Q3.3 — Démarrage de ticket avant movie dans Kubernetes
+
+Les Pods ticket peuvent démarrer avant les Pods movie. Leur JVM peut être vivante, donc la startupProbe peut réussir et la liveness rester `UP`, mais la readiness sera `DOWN` tant que movie sera injoignable.
+
+Les Pods ticket restent alors hors du trafic du Service. Quand movie devient disponible, les prochaines probes de readiness réussissent et Kubernetes leur envoie du trafic, sans devoir les redémarrer pour cette panne de dépendance.
