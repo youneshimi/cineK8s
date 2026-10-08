@@ -1007,3 +1007,100 @@ Une vérification complémentaire confirme `production` sur chacun des deux nouv
 La ConfigMap est utilisée via `envFrom` : Kubernetes injecte ses valeurs dans les variables d'environnement au lancement du conteneur. Modifier la ConfigMap ne met pas à jour les variables du processus déjà en cours. Les anciens Pods conservaient donc `MOVIE_ENVIRONMENT=kubernetes`.
 
 `kubectl rollout restart deployment/movie` a créé de nouveaux Pods, dont les conteneurs ont reçu la valeur actuelle `production`. Spring Boot l'a lue au démarrage. La configuration est séparée de l'image : il suffit de renouveler les Pods pour ce changement, sans recompiler le code ni reconstruire l'image. Voir la [documentation Kubernetes sur les ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/#using-configmaps).
+
+## Partie 7 — Questions de synthèse
+
+### Q7.1 — Trajet d'un appel de ticket vers movie
+
+Le résolveur DNS du Pod utilise CoreDNS pour résoudre `movie`, étendu en `movie.cinema-exam.svc.cluster.local`, vers le ClusterIP du Service movie : `10.110.158.150`.
+Le client envoie sa requête HTTP à cette adresse sur le port 8080.
+Les règles réseau installées par kube-proxy pour le Service choisissent un Pod movie prêt parmi ses endpoints et acheminent la connexion vers son port nommé `http`, qui correspond à 8080.
+Spring Boot dans ce Pod traite `/api/movies/1` et renvoie la réponse à ticket. Voir les documentations Kubernetes sur le [DNS](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#services) et le [routage des Services](https://kubernetes.io/docs/reference/networking/virtual-ips/).
+
+### Vérifications pour Q7.2
+
+J'ai créé quatre réservations en passant par l'Ingress :
+
+```powershell
+$body = '{"movieId":1,"seats":1}'
+1..4 | ForEach-Object {
+    (Invoke-WebRequest -UseBasicParsing -Method Post -Uri http://cinema.local/api/tickets -ContentType "application/json" -Body $body).Content
+}
+```
+
+```json
+{"id":3,"movieId":1,"movieTitle":"Pod Fiction","seats":1,"total":10.50,"createdAt":"2026-10-08T12:22:59.279686260Z"}
+{"id":1,"movieId":1,"movieTitle":"Pod Fiction","seats":1,"total":10.50,"createdAt":"2026-10-08T12:22:59.396542552Z"}
+{"id":4,"movieId":1,"movieTitle":"Pod Fiction","seats":1,"total":10.50,"createdAt":"2026-10-08T12:22:59.449639803Z"}
+{"id":2,"movieId":1,"movieTitle":"Pod Fiction","seats":1,"total":10.50,"createdAt":"2026-10-08T12:22:59.471765956Z"}
+```
+
+Puis j'ai consulté huit fois le nombre de réservations :
+
+```powershell
+1..8 | ForEach-Object {
+    (Invoke-RestMethod -Uri http://cinema.local/api/tickets -TimeoutSec 10).Count
+}
+```
+
+```text
+4
+2
+4
+2
+4
+2
+4
+2
+```
+
+Avant ce test, les listes contenaient déjà deux réservations sur une instance et aucune sur l'autre, issues des tests précédents. Les quatre nouvelles réservations se sont réparties à raison de deux par instance.
+
+### Q7.2 — Réservations en mémoire
+
+La liste n'est pas identique : les réponses alternent entre quatre et deux réservations, car les requêtes atteignent des Pods ticket différents.
+Chaque instance possède sa propre liste en mémoire et son propre compteur d'identifiants dans `TicketController` ; ces données ne sont pas partagées entre les réplicas.
+Si je supprime tous les Pods ticket, leurs remplaçants repartent avec une liste vide et un compteur réinitialisé : les réservations sont perdues.
+Pour les conserver et obtenir une liste commune, il faut une base de données persistante partagée par les instances, qui gère aussi des identifiants uniques et les transactions.
+
+### Vérifications pour Q7.3
+
+J'ai supprimé un seul Pod movie :
+
+```powershell
+kubectl --context minikube delete pod movie-7f49587d96-f47xd -n cinema-exam
+kubectl --context minikube get pods -n cinema-exam -l app=movie
+```
+
+```text
+pod "movie-7f49587d96-f47xd" deleted from cinema-exam namespace
+NAME                     READY   STATUS    RESTARTS   AGE
+movie-7f49587d96-sthpc   0/1     Running   0          3s
+movie-7f49587d96-sz6wh   1/1     Running   0          13m
+```
+
+Le nouveau Pod est apparu automatiquement. J'ai attendu qu'il soit prêt :
+
+```powershell
+kubectl --context minikube wait pod -n cinema-exam -l app=movie --for=condition=Ready --timeout=180s
+kubectl --context minikube get pods -n cinema-exam
+```
+
+```text
+pod/movie-7f49587d96-sthpc condition met
+pod/movie-7f49587d96-sz6wh condition met
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-7f49587d96-sthpc    1/1     Running   0          10s
+movie-7f49587d96-sz6wh    1/1     Running   0          13m
+ticket-66d95c98b6-djfpb   1/1     Running   0          61m
+ticket-66d95c98b6-lrtwv   1/1     Running   0          61m
+```
+
+Une vérification des `ownerReferences` confirme que le nouveau Pod appartient au ReplicaSet `movie-7f49587d96`. Celui-ci affiche deux réplicas souhaités, deux présents et deux prêts. Les Deployments movie et ticket sont tous deux à `2/2`.
+
+### Q7.3 — Remplacement d'un Pod supprimé
+
+Après la suppression de `movie-7f49587d96-f47xd`, un nouveau Pod, `movie-7f49587d96-sthpc`, est apparu puis est devenu prêt.
+Le ReplicaSet géré par le Deployment maintient les deux réplicas souhaités : il crée un remplaçant lorsqu'un Pod manque.
+Avec un Pod nu sans contrôleur, sa suppression ne déclencherait aucune recréation ; je perdrais aussi la gestion des réplicas et des mises à jour progressives offerte par le Deployment.
+La politique de redémarrage peut relancer un conteneur dans un Pod existant, mais elle ne recrée pas un Pod supprimé. Voir les documentations Kubernetes sur les [ReplicaSets](https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/) et le [cycle de vie des Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/).
