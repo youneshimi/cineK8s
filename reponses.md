@@ -673,3 +673,337 @@ Avec `pathType: Exact` sur `/api/movies`, seul ce chemin exact correspondrait à
 J'obtiens un HTTP 404 pour `/actuator/health`. L'Ingress ne déclare que les routes `/api/movies` et `/api/tickets`, donc ce chemin ne correspond à aucune règle.
 
 C'est souhaitable ici : les informations de santé restent accessibles aux probes Kubernetes à l'intérieur du cluster, sans être exposées par l'URL de l'application. Le 404 de l'Ingress ne signifie pas que les services sont en panne : leurs Pods sont prêts et les appels aux API fonctionnent.
+
+## Partie 6 — Casser pour comprendre
+
+### 6.1 — Arrêt des réplicas de movie
+
+#### Prédictions écrites avant l'arrêt de movie
+
+| Point | Prédiction après environ 30 secondes avec movie à 0 réplica |
+|---|---|
+| (a) Pods ticket | Les deux Pods restent `Running`, mais passent à `0/1` READY. Leur compteur RESTARTS reste à `0`. |
+| (b) Endpoints ticket | Aucune adresse prête : `kubectl get endpoints ticket` devrait afficher `<none>`. Les Pods ticket existent toujours, mais ne sont plus utilisables pour le trafic du Service. |
+| (c) GET via l'Ingress | `GET http://cinema.local/api/tickets` devrait répondre en HTTP `503`, car le contrôleur Ingress n'a plus de Pod ticket prêt auquel envoyer la requête. |
+| (d) Liveness ticket | La liveness devrait rester `UP`, car la JVM de ticket fonctionne et cette probe ne dépend pas de movie. |
+
+La readiness de ticket inclut le composant `movie`. Après trois échecs consécutifs de la readinessProbe, les Pods deviennent non prêts. La liveness vérifie la santé de ticket et ne provoque donc pas de redémarrage pour cette panne de dépendance.
+
+#### Observations pendant la panne
+
+Commandes exécutées :
+
+```powershell
+kubectl --context minikube scale deployment/movie -n cinema-exam --replicas=0
+Start-Sleep -Seconds 30
+kubectl --context minikube get pods -n cinema-exam
+kubectl --context minikube get endpoints ticket -n cinema-exam
+curl.exe -6 --noproxy "*" --max-time 10 -sS -o NUL -w "%{http_code}\n" http://cinema.local/api/tickets
+kubectl --context minikube describe pods -n cinema-exam -l app=ticket | Select-String "Readiness probe failed"
+kubectl --context minikube exec -n cinema-exam deploy/ticket -- wget -qO- http://localhost:8080/actuator/health/liveness
+```
+
+Pods après l'arrêt de movie :
+
+```text
+NAME                      READY   STATUS    RESTARTS   AGE
+ticket-66d95c98b6-djfpb   0/1     Running   0          28m
+ticket-66d95c98b6-lrtwv   0/1     Running   0          28m
+```
+
+Adresses prêtes du Service ticket :
+
+```text
+NAME     ENDPOINTS   AGE
+ticket               28m
+```
+
+La colonne ENDPOINTS est vide dans cette version de Kubernetes, plutôt que d'afficher littéralement `<none>`. Le résultat est bien celui attendu : aucune adresse prête. Une lecture des EndpointSlices confirme que les deux adresses `10.244.0.5` et `10.244.0.6` existent toujours, avec `ready: false`.
+
+Code HTTP de `GET /api/tickets` via l'Ingress :
+
+```text
+503
+```
+
+Liveness de ticket :
+
+```json
+{"status":"UP"}
+```
+
+La première commande `describe` filtrée n'a affiché aucune ligne. Une vérification complémentaire des événements a ensuite montré l'échec de la readiness pour les deux Pods :
+
+```powershell
+kubectl --context minikube get events -n cinema-exam --field-selector type=Warning -o wide
+```
+
+Extrait des événements observés :
+
+| Pod | Type / raison | Message |
+|---|---|---|
+| ticket-66d95c98b6-djfpb | Warning / Unhealthy | Readiness probe failed: HTTP probe failed with statuscode: 503 |
+| ticket-66d95c98b6-lrtwv | Warning / Unhealthy | Readiness probe failed: HTTP probe failed with statuscode: 503 |
+
+#### Rétablissement de movie
+
+Commandes exécutées :
+
+```powershell
+kubectl --context minikube scale deployment/movie -n cinema-exam --replicas=2
+kubectl --context minikube rollout status deployment/movie -n cinema-exam --timeout=180s
+kubectl --context minikube wait pod -n cinema-exam -l app=ticket --for=condition=Ready --timeout=180s
+kubectl --context minikube get pods -n cinema-exam
+kubectl --context minikube get endpoints movie ticket -n cinema-exam
+curl.exe -6 --noproxy "*" --max-time 10 -sS -o NUL -w "%{http_code}\n" http://cinema.local/api/tickets
+```
+
+Sorties observées :
+
+```text
+deployment "movie" successfully rolled out
+pod/ticket-66d95c98b6-djfpb condition met
+pod/ticket-66d95c98b6-lrtwv condition met
+
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-59684459f4-76zpj    1/1     Running   0          14s
+movie-59684459f4-thql2    1/1     Running   0          14s
+ticket-66d95c98b6-djfpb   1/1     Running   0          31m
+ticket-66d95c98b6-lrtwv   1/1     Running   0          31m
+
+NAME     ENDPOINTS                           AGE
+movie    10.244.0.10:8080,10.244.0.11:8080   36m
+ticket   10.244.0.5:8080,10.244.0.6:8080     31m
+```
+
+L'appel à `/api/tickets` via l'Ingress répond de nouveau en HTTP 200. Deux nouveaux Pods movie ont été créés. Les Pods ticket ont gardé leurs noms, leurs adresses et leur compteur RESTARTS à zéro : ils sont redevenus prêts automatiquement quand movie a été disponible.
+
+### Q6.1 — De l'arrêt de movie au HTTP 503
+
+1. Le passage de movie à zéro réplica supprime ses Pods. Le Service movie existe encore, mais il n'a plus de Pod disponible pour répondre à l'appel de ticket.
+2. Le composant de santé `movie` de ticket passe à `DOWN`. La readiness répond en HTTP 503 et, après les échecs consécutifs de la probe, les Pods ticket passent à `0/1`.
+3. Kubernetes marque les adresses des Pods ticket comme non prêtes dans les EndpointSlices. Il n'y a donc plus de backend ticket prêt à recevoir le trafic.
+4. Le contrôleur Ingress ne peut plus envoyer `GET /api/tickets` à un Pod ticket prêt et renvoie HTTP 503 au client.
+
+RESTARTS reste à `0` parce qu'un échec de readiness retire le Pod du trafic sans redémarrer son conteneur. La liveness reste `UP`, puisque ticket fonctionne encore : la panne concerne sa dépendance movie.
+
+### 6.2 — Dépannage de ticket-debug
+
+Le fichier fourni a été appliqué une première fois avant toute correction :
+
+```powershell
+kubectl --context minikube apply -f broken/ticket-debug.yaml
+Start-Sleep -Seconds 15
+kubectl --context minikube get pods -n cinema-exam -l app=ticket-debug
+kubectl --context minikube describe pods -n cinema-exam -l app=ticket-debug
+```
+
+Premier statut observé :
+
+```text
+NAME                            READY   STATUS             RESTARTS   AGE
+ticket-debug-6bc9655bd5-zmngr   0/1     ImagePullBackOff   0          22s
+```
+
+Le conteneur est en attente et les événements montrent `ErrImagePull`, puis `ImagePullBackOff`. La tentative de téléchargement de `docker.io/library/ticket-service:1.0.0` échoue avec le message :
+
+```text
+pull access denied, repository does not exist or may require authorization: server message: insufficient_scope: authorization failed
+```
+
+La politique `Always` oblige le runtime à contacter le registre, alors que l'image de l'examen a été construite localement et chargée dans Minikube. La première correction du YAML remplace uniquement `Always` par `IfNotPresent`.
+
+| # | Statut observé | Commande de diagnostic | Cause exacte | Correction apportée |
+|---|---|---|---|---|
+| 1 | `ImagePullBackOff` ; `ErrImagePull` dans les événements | `kubectl --context minikube describe pods -n cinema-exam -l app=ticket-debug` | `imagePullPolicy: Always` tente de télécharger l'image depuis Docker Hub, qui refuse cette référence. | Remplacer `Always` par `IfNotPresent` pour utiliser l'image présente sur le nœud. |
+| 2 | `CreateContainerConfigError` | `kubectl --context minikube describe pods -n cinema-exam -l app=ticket-debug`, puis lecture des événements du nouveau Pod et des ConfigMaps | La référence `ticket-configmap` ne correspond à aucune ConfigMap du namespace ; celle créée en partie 4 s'appelle `ticket-config`. | Remplacer le nom dans `configMapRef` par `ticket-config`. |
+| 3 | `Running`, mais `0/1` READY | `kubectl --context minikube describe pods -n cinema-exam -l app=ticket-debug`, puis lecture des événements et des logs | La readinessProbe appelle le port `8081`, alors que Tomcat écoute sur `8080` : connexion refusée. | Remplacer le port de la readinessProbe par `8080`. |
+
+#### Deuxième problème : référence de ConfigMap
+
+Après application de la première correction, le nouveau Pod dépasse le téléchargement de l'image, mais ne peut pas encore créer son conteneur :
+
+```text
+NAME                            READY   STATUS                       RESTARTS   AGE
+ticket-debug-6bc9655bd5-zmngr   0/1     ErrImagePull                 0          3m23s
+ticket-debug-748f79d8cf-t89g2   0/1     CreateContainerConfigError   0          21s
+```
+
+L'ancien Pod utilise encore la politique `Always`. Le nouveau utilise bien `IfNotPresent`, mais référence toujours `ticket-configmap`. La vérification des événements de ce nouveau Pod indique :
+
+```powershell
+kubectl --context minikube get events -n cinema-exam --field-selector involvedObject.name=ticket-debug-748f79d8cf-t89g2 -o wide
+kubectl --context minikube get configmaps -n cinema-exam
+```
+
+```text
+Container image "ticket-service:1.0.0" already present on machine and can be accessed by the pod
+Error: configmap "ticket-configmap" not found
+```
+
+La liste des ConfigMaps contient `ticket-config`, qui fournit `MOVIE_URL: http://movie:8080`. La deuxième correction remplace uniquement la référence `ticket-configmap` par `ticket-config`.
+
+#### Troisième problème : port de la readinessProbe
+
+Après application de la deuxième correction, le nouveau conteneur démarre, mais reste non prêt :
+
+```text
+NAME                            READY   STATUS                       RESTARTS   AGE
+ticket-debug-748f79d8cf-t89g2   0/1     CreateContainerConfigError   0          3m25s
+ticket-debug-c9999c4dc-fzdbq    0/1     Running                      0          41s
+```
+
+Le nouveau Pod utilise bien `ticket-config`. Les événements montrent cette fois l'erreur suivante :
+
+```text
+Readiness probe failed: Get "http://10.244.0.14:8081/actuator/health/readiness": dial tcp 10.244.0.14:8081: connect: connection refused
+```
+
+La lecture des logs confirme le port réel de l'application :
+
+```powershell
+kubectl --context minikube logs ticket-debug-c9999c4dc-fzdbq -n cinema-exam --tail=30
+```
+
+Extrait :
+
+```text
+Tomcat started on port 8080 (http) with context path '/'
+```
+
+La troisième correction remplace uniquement le port `8081` par `8080` dans la readinessProbe. Le statut `Running` indique que le conteneur fonctionne ; il ne suffit pas à rendre le Pod prêt si la probe appelle le mauvais port.
+
+#### Validation après les trois corrections
+
+Commandes exécutées :
+
+```powershell
+kubectl --context minikube apply -f broken/ticket-debug.yaml
+kubectl --context minikube rollout status deployment/ticket-debug -n cinema-exam --timeout=180s
+kubectl --context minikube get pods -n cinema-exam -l app=ticket-debug
+kubectl --context minikube exec -n cinema-exam deploy/ticket-debug -- wget -qO- http://localhost:8080/actuator/health/readiness
+```
+
+Résultat du rollout :
+
+```text
+deployment "ticket-debug" successfully rolled out
+```
+
+Pod final :
+
+```text
+NAME                           READY   STATUS    RESTARTS   AGE
+ticket-debug-56f4f5848-zlrtc   1/1     Running   0          8s
+```
+
+Readiness :
+
+```json
+{"status":"UP","components":{"movie":{"status":"UP"},"readinessState":{"status":"UP"}}}
+```
+
+Les trois corrections sont appliquées : `IfNotPresent`, référence à `ticket-config` et readiness sur le port 8080. Le Deployment a un réplica prêt et disponible.
+
+#### Nettoyage du Deployment de dépannage
+
+Après validation, le Deployment ticket-debug a été supprimé comme demandé :
+
+```powershell
+kubectl --context minikube delete -f broken/ticket-debug.yaml
+kubectl --context minikube get deployment -n cinema-exam
+kubectl --context minikube get pods -n cinema-exam
+```
+
+```text
+deployment.apps "ticket-debug" deleted from cinema-exam namespace
+
+NAME     READY   UP-TO-DATE   AVAILABLE   AGE
+movie    2/2     2            2           49m
+ticket   2/2     2            2           44m
+
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-59684459f4-76zpj    1/1     Running   0          12m
+movie-59684459f4-thql2    1/1     Running   0          12m
+ticket-66d95c98b6-djfpb   1/1     Running   0          44m
+ticket-66d95c98b6-lrtwv   1/1     Running   0          44m
+```
+
+Le fichier corrigé est conservé dans le dépôt. Le cluster ne contient plus que les deux Deployments de l'application.
+
+### 6.3 — Changement de configuration sans rebuild
+
+Avant le changement, la ConfigMap movie-config et l'API whoami indiquent toutes les deux `kubernetes`. Dans `10-config.yaml`, la valeur de `MOVIE_ENVIRONMENT` est changée en `production` pour cette expérience.
+
+#### Observation après modification de la ConfigMap
+
+Commandes exécutées avant de redémarrer les Pods :
+
+```powershell
+kubectl --context minikube apply -f k8s/10-config.yaml
+kubectl --context minikube get configmap movie-config -n cinema-exam -o yaml
+curl.exe -6 --noproxy "*" --max-time 10 -sS http://cinema.local/api/movies/whoami
+```
+
+Résultat de l'application :
+
+```text
+configmap/movie-config configured
+configmap/ticket-config unchanged
+```
+
+La ConfigMap du cluster contient bien la nouvelle valeur :
+
+```yaml
+data:
+  MOVIE_ENVIRONMENT: production
+```
+
+Mais l'ancien Pod répond encore :
+
+```json
+{"hostname":"movie-59684459f4-76zpj","environment":"kubernetes"}
+```
+
+La modification de la ConfigMap n'a donc pas changé la valeur déjà utilisée par le processus en cours.
+
+#### Observation après renouvellement des Pods
+
+Commandes exécutées :
+
+```powershell
+kubectl --context minikube rollout restart deployment/movie -n cinema-exam
+kubectl --context minikube rollout status deployment/movie -n cinema-exam --timeout=180s
+kubectl --context minikube get pods -n cinema-exam
+curl.exe -6 --noproxy "*" --max-time 10 -sS http://cinema.local/api/movies/whoami
+```
+
+Résultat du rollout :
+
+```text
+deployment "movie" successfully rolled out
+```
+
+Les nouveaux Pods movie sont prêts et les Pods ticket restent inchangés :
+
+```text
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-7f49587d96-f47xd    1/1     Running   0          6s
+movie-7f49587d96-sz6wh    1/1     Running   0          10s
+ticket-66d95c98b6-djfpb   1/1     Running   0          47m
+ticket-66d95c98b6-lrtwv   1/1     Running   0          47m
+```
+
+Réponse de whoami après le redémarrage :
+
+```json
+{"hostname":"movie-7f49587d96-f47xd","environment":"production"}
+```
+
+Une vérification complémentaire confirme `production` sur chacun des deux nouveaux Pods movie. Le Deployment utilise toujours `movie-service:1.0.0` et `/api/tickets` répond en HTTP 200. Aucune reconstruction d'image n'a été nécessaire.
+
+### Q6.3 — Prise en compte de la ConfigMap
+
+La ConfigMap est utilisée via `envFrom` : Kubernetes injecte ses valeurs dans les variables d'environnement au lancement du conteneur. Modifier la ConfigMap ne met pas à jour les variables du processus déjà en cours. Les anciens Pods conservaient donc `MOVIE_ENVIRONMENT=kubernetes`.
+
+`kubectl rollout restart deployment/movie` a créé de nouveaux Pods, dont les conteneurs ont reçu la valeur actuelle `production`. Spring Boot l'a lue au démarrage. La configuration est séparée de l'image : il suffit de renouveler les Pods pour ce changement, sans recompiler le code ni reconstruire l'image. Voir la [documentation Kubernetes sur les ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/#using-configmaps).
