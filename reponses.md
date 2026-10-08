@@ -1162,3 +1162,124 @@ curl.exe -6 --noproxy "*" --max-time 10 -sS http://cinema.local/api/movies/whoam
 200
 {"hostname":"movie-75587c7dff-jf7js","environment":"production"}
 ```
+
+### B2 — Mise à jour progressive sous trafic
+
+J'ai ajouté une stratégie explicite au Deployment movie :
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+```
+
+`maxUnavailable: 0` demande de maintenir les deux réplicas disponibles pendant la mise à jour. `maxSurge: 1` autorise un réplica supplémentaire pour démarrer un remplaçant avant de retirer un ancien Pod. La readiness utilise toujours `/actuator/health/readiness`, et `server.shutdown: graceful` est déjà configuré dans movie. Voir les documentations sur les [RollingUpdates Kubernetes](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-update-deployment) et l'[arrêt gracieux Spring Boot](https://docs.spring.io/spring-boot/3.5/reference/web/graceful-shutdown.html).
+
+#### Vérification de la stratégie appliquée
+
+```powershell
+kubectl --context minikube apply -f k8s/20-movie.yaml
+kubectl --context minikube get deployment movie -n cinema-exam -o jsonpath='{.spec.strategy}'
+kubectl --context minikube get pods -n cinema-exam -l app=movie
+```
+
+```text
+deployment.apps/movie configured
+service/movie unchanged
+{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0},"type":"RollingUpdate"}
+NAME                     READY   STATUS    RESTARTS   AGE
+movie-75587c7dff-jf7js   1/1     Running   0          3m26s
+movie-75587c7dff-w9g72   1/1     Running   0          3m22s
+```
+
+La modification de la stratégie seule n'a pas renouvelé les Pods : leurs noms sont identiques à ceux du test B1. Le remplacement sera déclenché par `kubectl rollout restart` pendant le test HTTP.
+
+#### Délai observé pendant le premier test simultané
+
+La boucle HTTP a commencé à `2026-10-08T14:38:57.1902609+02:00` et le redémarrage a été lancé après `2026-10-08T14:39:07.4376935+02:00`. Le rollout s'est terminé avant `2026-10-08T14:39:16.7369369+02:00`, mais curl a signalé un dépassement du délai de 10 secondes :
+
+```text
+curl: (28) Operation timed out after 10015 milliseconds with 0 bytes received
+```
+
+Les logs de l'Ingress montrent des délais de connexion vers les anciens Pods movie, dont les adresses étaient `10.244.0.21` et `10.244.0.22` :
+
+```text
+2026/10/08 12:39:17 [error] 162#162: *44492 upstream timed out (110: Operation timed out) while connecting to upstream, client: 127.0.0.1, server: cinema.local, request: "GET /api/movies HTTP/1.1", upstream: "http://10.244.0.21:8080/api/movies", host: "cinema.local"
+2026/10/08 12:39:22 [error] 162#162: *44492 upstream timed out (110: Operation timed out) while connecting to upstream, client: 127.0.0.1, server: cinema.local, request: "GET /api/movies HTTP/1.1", upstream: "http://10.244.0.22:8080/api/movies", host: "cinema.local"
+```
+
+Les logs de l'Ingress sont en UTC, soit deux heures de moins que les horaires PowerShell. Les nouveaux Pods `movie-77d677cd74-jx8nz` et `movie-77d677cd74-ng5vq` sont prêts, sans redémarrage, et leurs endpoints sont prêts. Une requête de contrôle répond HTTP 200.
+
+Pour laisser le temps au routage de prendre en compte le retrait d'un Pod avant l'arrêt de Tomcat, j'ai ajouté au conteneur un hook `preStop` qui exécute `sleep 10`. Le Pod dispose de `terminationGracePeriodSeconds: 40`, car le délai du hook fait partie de la période de terminaison ; il reste ensuite du temps pour l'arrêt gracieux de Spring Boot. Le retrait des endpoints et l'arrêt local du conteneur se déroulent en parallèle, comme l'explique la [documentation Kubernetes sur la terminaison des Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination-flow). Le test HTTP doit être refait après application pour vérifier l'effet de ce changement.
+
+Après application de ce changement et attente du rollout, les Pods sont :
+
+```text
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-7cf84bb4fc-df8sp    1/1     Running   0          8s
+movie-7cf84bb4fc-xxqlx    1/1     Running   0          15s
+ticket-66d95c98b6-djfpb   1/1     Running   0          74m
+ticket-66d95c98b6-lrtwv   1/1     Running   0          74m
+```
+
+Le contrôle de leur configuration confirme `preStop: sleep 10` et `terminationGracePeriodSeconds: 40` sur chacun des deux Pods movie. La stratégie reste `RollingUpdate` avec `maxUnavailable: 0` et `maxSurge: 1`. L'API répond HTTP 200 avant le nouveau test sous trafic.
+
+#### Test simultané après ajout du délai preStop
+
+Dans un terminal, j'ai lancé les 300 requêtes via l'Ingress :
+
+```powershell
+Get-Date -Format o
+1..300 | ForEach-Object {
+    curl.exe -6 --noproxy "*" --max-time 10 -sS -o NUL -w "%{http_code}\n" http://cinema.local/api/movies
+    Start-Sleep -Milliseconds 200
+} | Group-Object | Select-Object Count, Name
+Get-Date -Format o
+```
+
+L'heure relevée avant la boucle était `2026-10-08T14:43:42.3225306+02:00`. Pendant qu'elle tournait, j'ai exécuté dans un autre terminal :
+
+```powershell
+Get-Date -Format o
+kubectl --context minikube rollout restart deployment/movie -n cinema-exam
+kubectl --context minikube rollout status deployment/movie -n cinema-exam --timeout=180s
+Get-Date -Format o
+kubectl --context minikube get pods -n cinema-exam
+```
+
+```text
+2026-10-08T14:43:51.5972623+02:00
+deployment.apps/movie restarted
+deployment "movie" successfully rolled out
+2026-10-08T14:44:05.2046439+02:00
+NAME                      READY   STATUS        RESTARTS   AGE
+movie-6dd5ff4bd5-8kgk9    1/1     Running       0          8s
+movie-6dd5ff4bd5-wdnzj    1/1     Running       0          15s
+movie-7cf84bb4fc-df8sp    1/1     Terminating   0          100s
+movie-7cf84bb4fc-xxqlx    1/1     Terminating   0          107s
+ticket-66d95c98b6-djfpb   1/1     Running       0          76m
+ticket-66d95c98b6-lrtwv   1/1     Running       0          76m
+```
+
+Les anciens Pods encore en `Terminating` finissent leur arrêt ; le rollout est déjà terminé car les deux nouveaux réplicas sont disponibles. Une vérification ultérieure confirme la disparition des anciens Pods et les Deployments movie et ticket à `2/2`, sans redémarrage des conteneurs restants.
+
+Le résultat a été vérifié indépendamment en comptant, dans les logs de l'Ingress, les requêtes `GET /api/movies` entre `12:43:42Z` et `12:45:35Z` le 8 octobre 2026. Le comptage donne :
+
+```text
+Count Name
+----- ----
+  300 200
+```
+
+La première réponse est enregistrée à `12:43:42Z` et la dernière à `12:44:59Z`, soit de 14:43:42 à 14:44:59 en heure locale. Cet intervalle couvre le redémarrage. Les logs montrent le passage des anciennes adresses de Pods aux nouvelles `10.244.0.27` et `10.244.0.28`. Aucune ligne d'erreur n'est présente sur cette période et la durée maximale enregistrée pour ces requêtes est de `0.044` seconde.
+
+### QB2 — Résultat et rôle des trois éléments
+
+Après ajout du délai preStop, les logs de l'Ingress confirment 300 réponses HTTP 200 pendant le remplacement des Pods, sans erreur observée sur ce test.
+La stratégie `RollingUpdate`, avec `maxUnavailable: 0` et `maxSurge: 1`, permet de démarrer un remplaçant avant de retirer un ancien réplica disponible.
+La `readinessProbe` empêche d'envoyer le trafic aux nouveaux Pods tant que leur application n'est pas prête.
+`shutdown: graceful` laisse les requêtes en cours se terminer avant l'arrêt de l'application, au lieu de les interrompre.
+Dans cet environnement, le délai `preStop` de 10 secondes complète ces mécanismes en laissant le routage prendre en compte le retrait du Pod avant que Tomcat cesse d'accepter des requêtes. Le résultat décrit cette mesure locale ; il ne garantit pas l'absence d'erreur dans toutes les conditions.
