@@ -1,0 +1,69 @@
+name: Demonstration complete CineK8s
+
+# L'execution est lancee manuellement depuis l'onglet Actions.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  demonstration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      NO_COLOR: '1'
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v7
+
+      - name: Installer Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: '**/pom.xml'
+
+      - name: Preparer les outils Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+          mkdir -p "$RUNNER_TEMP/cinek8s-bin"
+          cd "$RUNNER_TEMP/cinek8s-bin"
+          curl -fsSLo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          curl -fsSLo minikube.sha256 https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64.sha256
+          printf '%s  minikube\n' "$(cat minikube.sha256)" | sha256sum --check
+          kube_version=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSLo kubectl "https://dl.k8s.io/release/$kube_version/bin/linux/amd64/kubectl"
+          curl -fsSLo kubectl.sha256 "https://dl.k8s.io/release/$kube_version/bin/linux/amd64/kubectl.sha256"
+          printf '%s  kubectl\n' "$(cat kubectl.sha256)" | sha256sum --check
+          chmod +x minikube kubectl
+          printf '%s\n' "$RUNNER_TEMP/cinek8s-bin" >> "$GITHUB_PATH"
+
+      - name: Verifier le script et ses garde-fous
+        shell: bash
+        run: |
+          shellcheck demo.sh scripts/demo-lib.sh scripts/test-demo.sh
+          bash scripts/test-demo.sh
+          bash demo.sh --check
+
+      - name: Rejouer toutes les parties et les bonus
+        shell: bash
+        run: bash demo.sh --profile cinek8s-demo-ci
+
+      - name: Conserver les rapports et les preuves
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rapport-demonstration-cinek8s
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Nettoyer le profil de demonstration du runner
+        if: always()
+        shell: bash
+        run: minikube delete -p cinek8s-demo-ci

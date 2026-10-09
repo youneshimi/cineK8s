@@ -17,6 +17,19 @@
 
 ---
 
+## ▶️ Démonstration automatisée du rendu
+
+Pour rejouer les étapes et leurs tests sur Linux/macOS :
+
+```bash
+bash demo.sh --check
+bash demo.sh
+```
+
+Le guide [DEMONSTRATION.md](DEMONSTRATION.md) décrit les prérequis, les scénarios et les rapports HTML générés. Le script utilise un profil Minikube dédié à la démonstration. Les réponses à l'examen sont dans [reponses.md](reponses.md).
+
+---
+
 ## 📋 Sommaire
 
 - [📌 Consignes générales](#-consignes-générales)

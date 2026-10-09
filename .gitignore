@@ -24,3 +24,6 @@ hs_err_pid*
 replay_pid*
 
 .idea
+
+# Rapports et fichiers temporaires de la demonstration
+/reports/

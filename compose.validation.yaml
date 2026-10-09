@@ -1,0 +1,36 @@
+# Verification Linux avant commit, depuis Docker Desktop (Windows compris).
+# Le daemon Docker est interne : aucun montage du socket Docker du PC.
+services:
+  docker:
+    image: docker:29-dind
+    privileged: true
+    # API accessible seulement sur le loopback partage avec validation.
+    command: ["dockerd", "--host=unix:///var/run/docker.sock", "--host=tcp://127.0.0.1:2375"]
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - validation-docker:/var/lib/docker
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 2s
+      timeout: 5s
+      retries: 45
+    stop_grace_period: 45s
+  validation:
+    build: ./validation
+    network_mode: service:docker
+    depends_on:
+      docker:
+        condition: service_healthy
+    environment:
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      NO_COLOR: "1"
+    volumes:
+      - .:/source:ro
+      - ./reports/linux:/reports
+      - validation-home:/home/demo
+    stop_grace_period: 45s
+
+volumes:
+  validation-docker:
+  validation-home:

@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Tests des garde-fous et de la gestion des erreurs, sans Docker ni Kubernetes.
+set -Eeuo pipefail
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+RUN_DIR="$ROOT_DIR/reports/self-tests-$$"
+mkdir -p "$RUN_DIR"
+STAGE='Tests du script'; PASSED=0; FAILED=0; START_SECONDS=$SECONDS; START_DATE='test'
+PROFILE=cinek8s-demo-test
+BLUE=''; GREEN=''; RED=''; RESET=''
+INGRESS_URL=http://127.0.0.1:18080
+MOVIE_PID=''; TICKET_PID=''; TICKET_PF_PID=''; INGRESS_PF_PID=''; TRAFFIC_PID=''
+FORWARD_PID=''; MOVIE_DOWN=0; DEBUG_CREATED=0; COMPOSE_STARTED=0; CLUSTER_STARTED=0
+: > "$RUN_DIR/checks.tsv"; : > "$RUN_DIR/commands.log"; : > "$RUN_DIR/http.log"
+# shellcheck source=scripts/demo-lib.sh
+source "$ROOT_DIR/scripts/demo-lib.sh"
+
+assert() {
+    if "$@"; then printf '[TEST OK] %s\n' "$*"; else printf '[TEST ECHEC] %s\n' "$*" >&2; exit 1; fi
+}
+
+assert bash -n "$ROOT_DIR/demo.sh"
+assert bash -n "$ROOT_DIR/scripts/demo-lib.sh"
+assert bash "$ROOT_DIR/demo.sh" --help
+
+for invalid in '--profile minikube' '--profile production' '--port-base 80' '--port-base 65530' '--port-base texte' '--inconnu'; do
+    # Les arguments de ces cas de test sont volontairement separes.
+    # shellcheck disable=SC2086
+    if bash "$ROOT_DIR/demo.sh" $invalid > "$RUN_DIR/invalid.txt" 2>&1; then
+        printf 'Argument dangereux accepte : %s\n' "$invalid" >&2; exit 1
+    else
+        assert test "$?" -eq 2
+    fi
+done
+
+assert test "$(html_escape '<script>&"')" = '&lt;script&gt;&amp;&quot;'
+record OK 'Un test positif' 'Exemple <non interprete>'
+write_report 0
+assert grep -q 'Demonstration reussie' "$RUN_DIR/resume.txt"
+assert grep -q 'Exemple &lt;non interprete&gt;' "$RUN_DIR/rapport.html"
+record ECHEC 'Un echec attendu dans le test' 'Cause <detail>'
+write_report 1
+assert grep -q 'Demonstration interrompue' "$RUN_DIR/resume.txt"
+assert grep -q 'Cause &lt;detail&gt;' "$RUN_DIR/rapport.html"
+
+# Simuler uniquement le transport HTTP : un HTTP 503 est une reponse,
+# un timeout curl est un echec reseau et ne doit pas etre traite comme un 200.
+curl() {
+    local output='' arg
+    while [ "$#" -gt 0 ]; do
+        arg=$1; shift
+        if [ "$arg" = -o ]; then output=$1; shift; fi
+    done
+    printf '{"status":"DOWN"}' > "$output"
+    printf '%s' "${FAKE_HTTP_CODE:-503}"
+    return "${FAKE_CURL_EXIT:-0}"
+}
+FAKE_HTTP_CODE=503; FAKE_CURL_EXIT=0
+assert request "$INGRESS_URL/api/tickets"
+assert test "$HTTP_CODE" = 503
+expect_http 'HTTP 503 attendu' 503 "$INGRESS_URL/api/tickets"
+FAKE_HTTP_CODE=000; FAKE_CURL_EXIT=28
+if request "$INGRESS_URL/api/movies"; then printf 'Timeout masque.\n' >&2; exit 1; fi
+if (expect_http 'Timeout inattendu' 200 "$INGRESS_URL/api/movies"); then
+    printf 'Le timeout doit faire echouer la verification.\n' >&2; exit 1
+fi
+
+if command -v jq >/dev/null; then
+    HTTP_BODY='{"status":"DOWN"}'
+    expect_json 'JSON conforme a l etat attendu' '.status == "DOWN"'
+    if (expect_json 'JSON avec un etat incorrect' '.status == "UP"'); then
+        printf 'Le mauvais etat JSON doit faire echouer le test.\n' >&2; exit 1
+    fi
+    # Ni un Pod terminating ni un nombre insuffisant de Pods ne doivent
+    # etre acceptes comme un deploiement termine.
+    pod_calls=0
+    k() {
+        pod_calls=$((pod_calls + 1))
+        case "$pod_calls" in
+            1) printf '%s\n' '{"items":[{"metadata":{"deletionTimestamp":"test"},"status":{"conditions":[{"type":"Ready","status":"True"}]}},{"metadata":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+            2) printf '%s\n' '{"items":[{"metadata":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+            *) printf '%s\n' '{"items":[{"metadata":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}},{"metadata":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+        esac
+    }
+    sleep() { :; }
+    wait_pods movie 2
+    assert test "$pod_calls" -eq 3
+    unset -f sleep
+else
+    printf '[TEST NON EXECUTE] Tests des expressions JSON : jq absent.\n'
+fi
+
+# Le webhook peut refuser une connexion pendant son demarrage. Une erreur
+# de validation de l'Ingress, elle, doit arreter le script immediatement.
+admission_calls=0
+k() {
+    admission_calls=$((admission_calls + 1))
+    if [ "$admission_calls" -lt 3 ]; then
+        printf '%s\n' 'failed calling webhook "validate.nginx.ingress.kubernetes.io": failed to call webhook: connect: connection refused' >&2
+        return 1
+    fi
+    printf 'ingress/cinema created (server dry run)\n'
+}
+sleep() { :; }
+wait_ingress_admission k8s/40-ingress.yaml
+assert test "$admission_calls" -eq 3
+k() { printf 'Error: ingress rejected: invalid path\n' >&2; return 1; }
+if (wait_ingress_admission k8s/40-ingress.yaml); then
+    printf 'Une erreur de validation a ete ignoree.\n' >&2; exit 1
+fi
+unset -f sleep
+
+# Un port-forward demarre par le script doit etre arrete, y compris si
+# sa preparation echoue. Les autres processus ne sont pas vises.
+k() { printf 'Forwarding from 127.0.0.1:18080 -> 80\n'; sleep 30; }
+start_forward ingress-nginx ingress-nginx-controller 18080 "$RUN_DIR/fake-forward.log"
+assert test "$INGRESS_PF_PID" = "$FORWARD_PID"
+assert kill -0 "$INGRESS_PF_PID"
+stop_pid "$INGRESS_PF_PID"
+if kill -0 "$INGRESS_PF_PID" 2>/dev/null; then printf 'Processus non arrete.\n' >&2; exit 1; fi
+INGRESS_PF_PID=''
+
+# Les colonnes conservees dans le rapport ne doivent pas etre corrompues
+# par des tabulations ou des retours a la ligne dans les sorties.
+record OK $'Titre\tavec\nretour' $'Detail\tavec\nretour'
+assert awk -F '\t' 'NF < 3 || NF > 4 {bad=1} END {exit bad}' "$RUN_DIR/checks.tsv"
+
+# Le nettoyage ne doit pas transformer un echec en succes. La restauration
+# de movie et la suppression du debug sont ici simulees, sans kubectl reel.
+cleanup_dir="$RUN_DIR/cleanup-test"
+mkdir -p "$cleanup_dir"
+cleanup_code=0
+(
+    RUN_DIR=$cleanup_dir
+    FAILED=0; PASSED=0; MOVIE_DOWN=1; DEBUG_CREATED=1; COMPOSE_STARTED=1
+    : > "$RUN_DIR/checks.tsv"
+    # Fonctions invoquees indirectement par le trap finish.
+    # shellcheck disable=SC2329
+    k() { printf 'kubectl %s\n' "$*" >> "$RUN_DIR/cleanup-calls.txt"; }
+    # shellcheck disable=SC2329
+    compose() { printf 'compose %s\n' "$*" >> "$RUN_DIR/cleanup-calls.txt"; }
+    trap finish EXIT
+    exit 9
+) > "$RUN_DIR/cleanup-test-output.txt" 2>&1 || cleanup_code=$?
+assert test "$cleanup_code" -eq 9
+assert grep -q 'scale deployment/movie --replicas=2' "$cleanup_dir/cleanup-calls.txt"
+assert grep -q 'delete deployment ticket-debug --ignore-not-found' "$cleanup_dir/cleanup-calls.txt"
+assert grep -q 'compose down' "$cleanup_dir/cleanup-calls.txt"
+assert grep -q 'Demonstration interrompue' "$cleanup_dir/resume.txt"
+printf '\nTests du script termines. Aucun cluster ni conteneur cree.\n'
