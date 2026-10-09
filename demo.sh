@@ -163,11 +163,15 @@ run k apply -f k8s/00-namespace.yaml
 run k apply -f k8s/10-config.yaml
 # Rejouer l'etat initial de la partie 4, puis le changement de la partie 6.
 run kn patch configmap movie-config --type=merge -p '{"data":{"MOVIE_ENVIRONMENT":"kubernetes"}}'
+movie_existing=$(kn get deployment movie --ignore-not-found -o name)
+ticket_existing=$(kn get deployment ticket --ignore-not-found -o name)
+# Attendre movie avant de lancer ticket limite les JVM en demarrage simultane.
+# Un Deployment neuf lit deja les images et la ConfigMap : aucun restart initial.
 run k apply -f k8s/20-movie.yaml
-run k apply -f k8s/30-ticket.yaml
-# Relecture de l'image et de la ConfigMap meme lors d'une seconde execution.
-run kn rollout restart deployment/movie deployment/ticket
+if [ -n "$movie_existing" ]; then run kn rollout restart deployment/movie; fi
 wait_pods movie 2
+run k apply -f k8s/30-ticket.yaml
+if [ -n "$ticket_existing" ]; then run kn rollout restart deployment/ticket; fi
 wait_pods ticket 2
 capture "$RUN_DIR/part4-pods.txt" kn get pods -o wide
 capture "$RUN_DIR/part4-endpoints.json" kn get endpointslices -o json
@@ -322,20 +326,11 @@ for pod in $movie_pods; do
     check "Ecriture de /test refusee : $pod" grep -qi 'Read-only file system' "$RUN_DIR/readonly-$pod.txt"
 done
 
-section 'Bonus B2 — 300 requetes pendant le rolling update'
+section 'Bonus B2 — au moins 300 requetes pendant le rolling update'
 capture "$RUN_DIR/rolling-strategy.json" kn get deployment movie -o json
 check 'Strategie maxUnavailable=0 et maxSurge=1' jq -e '.spec.strategy.type == "RollingUpdate" and .spec.strategy.rollingUpdate.maxUnavailable == 0 and .spec.strategy.rollingUpdate.maxSurge == 1' "$RUN_DIR/rolling-strategy.json"
 : > "$RUN_DIR/traffic.tsv"
-(
-    for ((i=1; i<=300; i++)); do
-        rc=0
-        sample=$(curl --noproxy '*' --silent --show-error --connect-timeout 3 --max-time 10 \
-            --header 'Host: cinema.local' -o /dev/null -w '%{http_code}' "$INGRESS_URL/api/movies") || rc=$?
-        printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$i" "${sample:-000}" "$rc" >> "$RUN_DIR/traffic.tsv"
-        if [ "$i" -eq 1 ]; then : > "$RUN_DIR/traffic-started"; fi
-        sleep 0.2
-    done
-) > "$RUN_DIR/traffic-errors.log" 2>&1 &
+sample_rollout_traffic > "$RUN_DIR/traffic-errors.log" 2>&1 &
 TRAFFIC_PID=$!
 deadline=$((SECONDS + 30))
 while [ ! -f "$RUN_DIR/traffic-started" ]; do
@@ -344,18 +339,19 @@ while [ ! -f "$RUN_DIR/traffic-started" ]; do
 done
 rollout_start=$(date +%s)
 run kn rollout restart deployment/movie
-run kn --request-timeout=0 rollout status deployment/movie --timeout=240s
+run kn --request-timeout=0 rollout status deployment/movie --timeout=900s
 rollout_end=$(date +%s)
-log 'Rollout termine. Attente du bilan des 300 requetes...'
+: > "$RUN_DIR/rollout-finished"
+log 'Rollout termine. Attente du bilan du trafic...'
 while kill -0 "$TRAFFIC_PID" 2>/dev/null; do printf '.'; sleep 2; done
 if ! wait "$TRAFFIC_PID"; then fail 'Boucle de trafic interrompue'; fi
 TRAFFIC_PID=''
 printf '\n'
 samples=$(wc -l < "$RUN_DIR/traffic.tsv" | tr -d ' ')
-check 'Exactement 300 requetes executees' test "$samples" -eq 300
+check "Au moins 300 requetes executees ($samples)" test "$samples" -ge 300
 # $3 et $4 designent les colonnes awk.
 # shellcheck disable=SC2016
-check '300 reponses HTTP 200 sans erreur curl' awk -F '\t' '$3 != "200" || $4 != "0" {bad=1} END {exit bad}' "$RUN_DIR/traffic.tsv"
+check "$samples reponses HTTP 200 sans erreur curl" awk -F '\t' '$3 != "200" || $4 != "0" {bad=1} END {exit bad}' "$RUN_DIR/traffic.tsv"
 first_request=$(awk -F '\t' 'NR==1 {print $1}' "$RUN_DIR/traffic.tsv")
 last_request=$(awk -F '\t' 'END {print $1}' "$RUN_DIR/traffic.tsv")
 check 'Trafic commence avant le rollout' test "$first_request" -le "$rollout_start"

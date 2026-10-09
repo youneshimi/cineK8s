@@ -387,7 +387,7 @@ Le Service sélectionne bien les deux Pods grâce au label `app: movie`. Vérifi
 
 Le fichier `30-ticket.yaml` contient le Deployment et le Service de ticket. Il utilise deux réplicas de l'image `ticket-service:1.0.0`, avec `IfNotPresent` et la ConfigMap `ticket-config`. Le Service sélectionne les Pods avec le label `app: ticket` et envoie le trafic du port 8080 vers le port nommé `http` du conteneur.
 
-Les ressources, la startupProbe et la livenessProbe sont identiques à celles de movie. La readinessProbe utilise `/actuator/health/readiness`, toutes les 5 secondes, avec `timeoutSeconds: 3` : elle doit laisser le temps à ticket de vérifier movie par HTTP.
+Les ressources, la startupProbe et la livenessProbe sont identiques à celles de movie. La readinessProbe utilise `/actuator/health/readiness`, toutes les 5 secondes, avec `timeoutSeconds: 5` : elle doit laisser le temps à ticket de vérifier movie par HTTP, y compris sur une VM plus lente.
 
 Commandes exécutées :
 
@@ -486,7 +486,7 @@ Cet ordre est confirmé par le [code de parcours des fichiers de kubectl](https:
 
 La startupProbe attend que Spring Boot ait démarré. Tant qu'elle n'a pas réussi, Kubernetes suspend la livenessProbe et la readinessProbe : le conteneur ne peut donc pas encore être déclaré prêt. Après son succès, la readinessProbe doit aussi réussir pour passer à `1/1` et recevoir du trafic.
 
-Un `0/1` temporaire au démarrage est normal. La startupProbe laisse environ 60 secondes à l'application, avec 30 échecs possibles et un intervalle de 2 secondes. La durée réelle varie : dans mon essai, les Pods ticket étaient déjà `1/1` à 11 secondes. Voir la [documentation Kubernetes sur les probes](https://kubernetes.io/docs/concepts/workloads/pods/probes/).
+Un `0/1` temporaire au démarrage est normal. Dans mon premier essai, les Pods ticket étaient déjà `1/1` à 11 secondes, avec une startupProbe de 30 échecs possibles espacés de 2 secondes. Un essai ultérieur sur VM a montré que ce budget de 60 secondes pouvait provoquer des redémarrages avant la fin du démarrage. Les manifests actuels laissent donc environ 300 secondes à l'application, avec 60 échecs possibles espacés de 5 secondes et un délai de réponse de 5 secondes. Voir la [documentation Kubernetes sur les probes](https://kubernetes.io/docs/concepts/workloads/pods/probes/).
 
 ### Q4.3 — Images avec Always
 

@@ -40,9 +40,11 @@ Les nouveaux ports seront alors 19080, 19085 et 19086. Il n'est pas nécessaire 
 | Partie 6.3 | ConfigMap : `kubernetes` → `production`, ancienne valeur avant renouvellement des Pods, nouvelle valeur après, sans rebuild |
 | Partie 7 | Quatre réservations, listes propres aux instances, remplacement automatique d'un Pod movie, perte des réservations après remplacement des Pods ticket |
 | Bonus B1 | Contexte de sécurité sur tous les Pods movie, UID 10001, écriture `/test` refusée |
-| Bonus B2 | 300 requêtes démarrées automatiquement avant un rollout ; vérification de 300 codes 200, des erreurs curl et des horaires de chevauchement |
+| Bonus B2 | Au moins 300 requêtes démarrées automatiquement avant un rollout et poursuivies jusqu'après sa fin ; vérification des codes 200, des erreurs curl et des horaires de chevauchement |
 
 La démonstration applique les manifests finaux : les réglages des bonus sont donc présents dès la partie 4, puis contrôlés dans la section bonus. Pour illustrer les listes en mémoire, une réservation supplémentaire est ajoutée si nécessaire afin d'avoir un total impair entre les deux instances et de rendre la différence observable.
+
+Pour les machines virtuelles plus lentes, les sondes de démarrage de movie et ticket autorisent environ **300 secondes** (60 échecs espacés de 5 secondes), avec un délai de réponse HTTP de 5 secondes. Les sondes de liveness et de readiness disposent aussi de 5 secondes par appel. Le script attend movie avant de lancer ticket et ne redémarre pas un Deployment qu'il vient de créer. L'attente des Pods et du rolling update est limitée à 900 secondes ; elle se termine dès que l'état attendu est atteint. Les erreurs ne sont pas transformées en succès.
 
 L'observation des deux instances utilise jusqu'à 30 appels : le test n'exige pas une alternance stricte à chaque requête. Les images construites sont affichées avec leur utilisateur et leur taille ; leurs métadonnées sont conservées dans `docker-images.json`.
 
@@ -59,7 +61,7 @@ reports/AAAAMMJJ-HHMMSS-PID/
 ├── checks.tsv               Résultats structurés
 ├── commands.log             Commandes et sorties
 ├── http.log                 Codes et corps des réponses HTTP
-├── traffic.tsv              Les 300 requêtes, avec horaires et codes curl
+├── traffic.tsv              Au moins 300 requêtes, avec horaires et codes curl
 ├── rolling-times.txt        Horaires du début et de la fin du rollout
 ├── tests-movie-service/     Rapports XML des tests Maven
 ├── tests-ticket-service/
@@ -69,6 +71,8 @@ reports/AAAAMMJJ-HHMMSS-PID/
 Ouvrir **`rapport.html`** dans un navigateur. Les liens du rapport sont relatifs : conserver le dossier entier pour consulter les preuves. Les rapports générés sont exclus de Git.
 
 Le script s'arrête à la première vérification inattendue et retourne **1**. Un résultat attendu comme HTTP 503 pendant une panne ou l'échec de `touch /test` compte comme une réussite uniquement si la vérification correspondante passe. Le code **0** indique que toutes les vérifications exécutées ont réussi ; **2** indique une option invalide, **130** une interruption clavier.
+
+Si des Pods ne deviennent pas prêts, les fichiers `diagnostic-*.txt`, `diagnostic-*.json` et `diagnostic-*.log` conservent leurs états, les événements, les conditions du nœud et les logs courants et précédents de chaque Pod. Ils permettent de distinguer un échec d'image, de montage, de démarrage Java ou de ressources. Un délai dépassé reste un échec à diagnostiquer.
 
 ## Environnement de démonstration et fin d'exécution
 
@@ -147,7 +151,9 @@ Le **9 octobre 2026**, la démonstration complète a réussi dans l'environnemen
 - **4 Pods prêts à la fin**, avec aucun redémarrage des conteneurs dans l'état final.
 - Code de sortie **0**, durée **11 min 12 s**.
 
-Les preuves de cette exécution sont dans `reports/linux/20261009-004917-44/`. Les empreintes SHA-256 identifient la version des trois scripts exécutés. Après cette validation, l'en-tête personnalisé **Script BY Younes** a été ajouté à l'affichage. Les rapports sont exclus de Git ; chaque nouvelle exécution produit ses propres preuves. Cette validation porte sur Ubuntu amd64 ; aucune exécution macOS n'a été réalisée.
+Les preuves de cette exécution sont dans `reports/linux/20261009-004917-44/`. Les empreintes SHA-256 identifient la version des trois scripts exécutés. Les rapports sont exclus de Git ; chaque nouvelle exécution produit ses propres preuves. Cette validation porte sur Ubuntu amd64 ; aucune exécution macOS n'a été réalisée.
+
+Un essai ultérieur sur une VM Ubuntu 26.04 a réussi les 40 premières vérifications, puis dépassé le délai d'attente de movie. Les événements Kubernetes montrent cinq redémarrages provoqués par la sonde de démarrage de 60 secondes ; les deux Pods sont finalement devenus prêts. Les budgets des sondes, le démarrage successif des services, les diagnostics et la durée d'observation du rollout ont été adaptés après cet essai. **Le résultat de 123 vérifications ci-dessus concerne la version précédente : une nouvelle exécution complète sur cette VM est nécessaire pour valider ces corrections avant commit.**
 
 ## Validation complète sur Linux depuis GitHub
 

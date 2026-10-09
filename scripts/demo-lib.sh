@@ -111,8 +111,33 @@ wait_http() {
     fail "$title" "Delai de 180 secondes depasse ; HTTP $HTTP_CODE."
 }
 
+collect_pod_diagnostics() {
+    local app=$1 pod
+    log "Diagnostics des Pods $app : $RUN_DIR/diagnostic-$app-*"
+    # Ces lectures ne doivent pas masquer la cause initiale si l'API repond mal.
+    kn get pods -l "app=$app" -o wide > "$RUN_DIR/diagnostic-$app-pods.txt" 2>&1 || true
+    kn describe pods -l "app=$app" > "$RUN_DIR/diagnostic-$app-describe.txt" 2>&1 || true
+    kn get events --sort-by=.lastTimestamp > "$RUN_DIR/diagnostic-$app-events.txt" 2>&1 || true
+    kn get deployment "$app" -o json > "$RUN_DIR/diagnostic-$app-deployment.json" 2>&1 || true
+    k describe nodes > "$RUN_DIR/diagnostic-$app-nodes.txt" 2>&1 || true
+    if [ -s "$RUN_DIR/pods-$app.json" ]; then
+        jq -r '.items[].metadata.name // empty' "$RUN_DIR/pods-$app.json" \
+            > "$RUN_DIR/diagnostic-$app-names.txt" 2>/dev/null || true
+        while IFS= read -r pod; do
+            pod=${pod%$'\r'}
+            [ -n "$pod" ] || continue
+            kn logs "$pod" --all-containers=true --tail=120 \
+                > "$RUN_DIR/diagnostic-$pod-current.log" 2>&1 || true
+            kn logs "$pod" --all-containers=true --previous --tail=120 \
+                > "$RUN_DIR/diagnostic-$pod-previous.log" 2>&1 || true
+        done < "$RUN_DIR/diagnostic-$app-names.txt"
+    fi
+    cat "$RUN_DIR/diagnostic-$app-pods.txt"
+    tail -n 15 "$RUN_DIR/diagnostic-$app-events.txt"
+}
+
 wait_pods() {
-    local app=$1 count=$2 deadline=$((SECONDS + 240))
+    local app=$1 count=$2 deadline=$((SECONDS + 900))
     log "Attente de $count Pod(s) $app prets..."
     while [ "$SECONDS" -lt "$deadline" ]; do
         if kn get pods -l "app=$app" -o json > "$RUN_DIR/pods-$app.json" 2>> "$RUN_DIR/commands.log" &&
@@ -126,7 +151,25 @@ wait_pods() {
         fi
         sleep 2
     done
-    fail "Pods $app" "Delai de 240 secondes depasse."
+    collect_pod_diagnostics "$app"
+    fail "Pods $app" "Delai de 900 secondes depasse. Consulter diagnostic-$app-describe.txt et les logs diagnostic-*-previous.log."
+}
+
+sample_rollout_traffic() {
+    local i=1 rc sample rollout_done
+    while :; do
+        rollout_done=0
+        # Une derniere requete doit commencer apres la fin observee du rollout.
+        if [ -f "$RUN_DIR/rollout-finished" ]; then rollout_done=1; fi
+        rc=0
+        sample=$(curl --noproxy '*' --silent --show-error --connect-timeout 3 --max-time 10 \
+            --header 'Host: cinema.local' -o /dev/null -w '%{http_code}' "$INGRESS_URL/api/movies") || rc=$?
+        printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$i" "${sample:-000}" "$rc" >> "$RUN_DIR/traffic.tsv"
+        if [ "$i" -eq 1 ]; then : > "$RUN_DIR/traffic-started"; fi
+        if [ "$i" -ge 300 ] && [ "$rollout_done" -eq 1 ]; then break; fi
+        sleep 0.2
+        i=$((i + 1))
+    done
 }
 
 stop_pid() {
@@ -184,7 +227,7 @@ wait_ingress_admission() {
 }
 
 wait_debug_error() {
-    local expected=$1 deadline=$((SECONDS + 180)) pod
+    local expected=$1 deadline=$((SECONDS + 360)) pod
     while [ "$SECONDS" -lt "$deadline" ]; do
         kn get pods -l app=ticket-debug -o json > "$RUN_DIR/debug-pods.json"
         if [ "$expected" = Probe8081 ]; then
@@ -205,7 +248,7 @@ wait_debug_error() {
         fi
         sleep 2
     done
-    fail "Erreur attendue : $expected" 'Non observee en 180 secondes.'
+    fail "Erreur attendue : $expected" 'Non observee en 360 secondes.'
 }
 
 html_escape() {
@@ -239,7 +282,7 @@ HTML
         printf '<h1>%s</h1><p class="intro">Profil : <code>%s</code> · Debut : %s</p>\n' \
             "$outcome" "$(html_escape "$PROFILE")" "$(html_escape "$START_DATE")"
         printf '<div class="cards"><div class="card"><strong>%s</strong>verifications reussies</div><div class="card"><strong>%s</strong>echecs</div><div class="card"><strong>%s s</strong>duree</div></div>\n' "$PASSED" "$FAILED" "$elapsed"
-        printf '<p><a href="commands.log">Commandes et sorties</a> · <a href="http.log">Reponses HTTP</a> · <a href="checks.tsv">Resultats TSV</a> · <a href="traffic.tsv">300 requetes du rollout</a></p>\n'
+        printf '<p><a href="commands.log">Commandes et sorties</a> · <a href="http.log">Reponses HTTP</a> · <a href="checks.tsv">Resultats TSV</a> · <a href="traffic.tsv">Trafic du rollout</a></p>\n'
         printf '<table><thead><tr><th>Etape</th><th>Resultat</th><th>Verification</th><th>Detail</th></tr></thead><tbody>\n'
         while IFS=$'\t' read -r stage verdict title detail; do
             printf '<tr><td>%s</td><td class="%s">%s</td><td>%s</td><td>%s</td></tr>\n' \
@@ -262,7 +305,7 @@ finish() {
     stop_pid "$INGRESS_PF_PID"
     if [ "$MOVIE_DOWN" -eq 1 ]; then
         kn scale deployment/movie --replicas=2 >> "$RUN_DIR/recovery.log" 2>&1
-        kn --request-timeout=0 rollout status deployment/movie --timeout=180s >> "$RUN_DIR/recovery.log" 2>&1
+        kn --request-timeout=0 rollout status deployment/movie --timeout=900s >> "$RUN_DIR/recovery.log" 2>&1
     fi
     if [ "$DEBUG_CREATED" -eq 1 ]; then kn delete deployment ticket-debug --ignore-not-found >> "$RUN_DIR/recovery.log" 2>&1; fi
     if [ "$COMPOSE_STARTED" -eq 1 ]; then

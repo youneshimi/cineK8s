@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Tests des garde-fous et de la gestion des erreurs, sans Docker ni Kubernetes.
+# Les modifications de RUN_DIR dans les sous-shells isolent leurs rapports.
+# shellcheck disable=SC2030,SC2031
 set -Eeuo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUN_DIR="$ROOT_DIR/reports/self-tests-$$"
@@ -89,6 +91,33 @@ else
     printf '[TEST NON EXECUTE] Tests des expressions JSON : jq absent.\n'
 fi
 
+# Un delai depasse doit rester un echec, avec la cause de demarrage et
+# les logs precedents disponibles. L'API et l'horloge sont simulees ici.
+if command -v jq >/dev/null; then
+    timeout_dir="$RUN_DIR/pod-timeout"
+    mkdir -p "$timeout_dir"
+    timeout_code=0
+    (
+        RUN_DIR=$timeout_dir
+        : > "$RUN_DIR/checks.tsv"; : > "$RUN_DIR/commands.log"
+        k() {
+            case "$*" in
+                *'get pods'*'-o json'*)
+                    printf '%s\n' '{"items":[{"metadata":{"name":"movie-test"},"status":{"conditions":[{"type":"Ready","status":"False"}]}}]}'
+                    SECONDS=$((SECONDS + 901)) ;;
+                *'describe pods'*) printf 'Reason: FailedMount\n' ;;
+                *'logs'*'--previous'*) printf 'Previous startup error\n' ;;
+                *) printf 'Diagnostic simulated\n' ;;
+            esac
+        }
+        sleep() { :; }
+        wait_pods movie 2
+    ) > "$timeout_dir/output.txt" 2>&1 || timeout_code=$?
+    assert test "$timeout_code" -eq 1
+    assert grep -q FailedMount "$timeout_dir/diagnostic-movie-describe.txt"
+    assert grep -q 'Previous startup error' "$timeout_dir/diagnostic-movie-test-previous.log"
+fi
+
 # Le webhook peut refuser une connexion pendant son demarrage. Une erreur
 # de validation de l'Ingress, elle, doit arreter le script immediatement.
 admission_calls=0
@@ -108,6 +137,52 @@ if (wait_ingress_admission k8s/40-ingress.yaml); then
     printf 'Une erreur de validation a ete ignoree.\n' >&2; exit 1
 fi
 unset -f sleep
+
+# Le trafic doit couvrir aussi un rollout plus long que les 300 premiers appels.
+# Les erreurs HTTP et reseau sont conservees, jamais remplacees par un succes.
+for scenario in rapide lent erreurs; do
+    traffic_dir="$RUN_DIR/traffic-$scenario"
+    mkdir -p "$traffic_dir"
+    (
+        RUN_DIR=$traffic_dir
+        : > "$RUN_DIR/traffic.tsv"
+        if [ "$scenario" = rapide ]; then : > "$RUN_DIR/rollout-finished"; fi
+        printf '0\n' > "$RUN_DIR/count.txt"
+        sleep() { :; }
+        date() { printf '12345\n'; }
+        curl() {
+            local call
+            read -r call < "$RUN_DIR/count.txt"
+            call=$((call + 1))
+            printf '%s\n' "$call" > "$RUN_DIR/count.txt"
+            if [ "$call" -eq 350 ]; then : > "$RUN_DIR/rollout-finished"; fi
+            if [ "$scenario" = erreurs ]; then
+                case "$call" in
+                    2) printf 503; return 0 ;;
+                    3) printf 000; return 28 ;;
+                esac
+            fi
+            printf 200
+        }
+        sample_rollout_traffic
+    )
+    assert test -f "$traffic_dir/traffic-started"
+    if [ "$scenario" = rapide ]; then
+        assert test "$(wc -l < "$traffic_dir/traffic.tsv")" -eq 300
+    else
+        # Le marqueur apparait pendant l'appel 350 : l'appel 351 suit sa creation.
+        assert test "$(wc -l < "$traffic_dir/traffic.tsv")" -eq 351
+    fi
+    if [ "$scenario" = erreurs ]; then
+        # $3 et $4 sont les colonnes awk, pas des variables du shell.
+        # shellcheck disable=SC2016
+        assert awk -F '\t' 'NR==2 {if ($3 != "503" || $4 != 0) exit 1} NR==3 {if ($3 != "000" || $4 != 28) exit 1}' "$traffic_dir/traffic.tsv"
+        # shellcheck disable=SC2016
+        if awk -F '\t' '$3 != "200" || $4 != "0" {bad=1} END {exit bad}' "$traffic_dir/traffic.tsv"; then
+            printf 'Erreurs de trafic masquees.\n' >&2; exit 1
+        fi
+    fi
+done
 
 # Un port-forward demarre par le script doit etre arrete, y compris si
 # sa preparation echoue. Les autres processus ne sont pas vises.
