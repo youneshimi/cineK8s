@@ -1,6 +1,6 @@
 # CinéK8s — démonstration pour le professeur
 
-Le script `demo.sh` rejoue les parties 1 à 7 et les deux bonus du README, vérifie les résultats attendus et génère un rapport HTML. Les explications de l'examen restent dans `reponses.md`.
+Le script `demo.sh` rejoue les parties 1 à 7 et les deux bonus de l’énoncé [examen.md](examen.md), vérifie les résultats attendus et génère un rapport HTML. Les explications de l'examen restent dans `reponses.md`.
 
 L'en-tête **Script BY Younes** s'affiche en rouge dans un terminal avec les couleurs activées. Il reste lisible sans couleurs dans les logs ou lorsque `NO_COLOR` est défini.
 
@@ -33,7 +33,7 @@ Les nouveaux ports seront alors 19080, 19085 et 19086. Il n'est pas nécessaire 
 | Partie 1 | Readiness dépendante de movie et arrêt gracieux ; renvoi vers les réponses de synthèse |
 | Partie 2 | Compilation et tests Maven des deux services, lancement local, réservation à 36 €, erreurs 422/409/400, panne de movie, readiness DOWN, liveness UP et POST 503 |
 | Partie 3 | Build des images et lancement du Compose fourni, environnement `compose`, réservation à 21 €, UID 10001 dans les deux conteneurs |
-| Partie 4 | Profil Minikube dédié, chargement des images, validation des manifests, deux Pods prêts par service, EndpointSlices et appel interne par DNS, réservation à 24 € |
+| Partie 4 | Profil Minikube dédié, contrôle de CoreDNS et kube-proxy, chargement des images, validation des manifests, deux Pods prêts par service, EndpointSlices et appel interne par DNS, réservation à 24 € |
 | Partie 5 | Ingress, quatre films, réservation à 90 €, deux hostnames movie, routage Prefix et Actuator inaccessible en 404 |
 | Partie 6.1 | Movie à zéro réplica, ticket non prêt, aucun endpoint ticket prêt, Ingress 503, liveness UP, compteurs de redémarrage inchangés, puis restauration |
 | Partie 6.2 | Reproduction des trois bugs du YAML initial, correction un par un et suppression de ticket-debug après réussite |
@@ -45,6 +45,8 @@ Les nouveaux ports seront alors 19080, 19085 et 19086. Il n'est pas nécessaire 
 La démonstration applique les manifests finaux : les réglages des bonus sont donc présents dès la partie 4, puis contrôlés dans la section bonus. Pour illustrer les listes en mémoire, une réservation supplémentaire est ajoutée si nécessaire afin d'avoir un total impair entre les deux instances et de rendre la différence observable.
 
 Pour les machines virtuelles plus lentes, les sondes de démarrage de movie et ticket autorisent environ **300 secondes** (60 échecs espacés de 5 secondes), avec un délai de réponse HTTP de 5 secondes. Les sondes de liveness et de readiness disposent aussi de 5 secondes par appel. Le script attend movie avant de lancer ticket et ne redémarre pas un Deployment qu'il vient de créer. L'attente des Pods et du rolling update est limitée à 900 secondes ; elle se termine dès que l'état attendu est atteint. Les erreurs ne sont pas transformées en succès.
+
+Un nœud `Ready` ne garantit pas que le réseau du cluster fonctionne. Après le démarrage de Minikube, le script attend donc que les Pods CoreDNS et kube-proxy existent et soient tous prêts, pendant au maximum 180 secondes. Si ce contrôle échoue, il conserve les états, événements, endpoints DNS et logs courants et précédents dans `network-*`, puis s'arrête avant de déployer les applications. Ce contrôle signale une panne du cluster ; il ne modifie pas le réseau de la machine pour la réparer.
 
 L'observation des deux instances utilise jusqu'à 30 appels : le test n'exige pas une alternance stricte à chaque requête. Les images construites sont affichées avec leur utilisateur et leur taille ; leurs métadonnées sont conservées dans `docker-images.json`.
 
@@ -82,15 +84,19 @@ Le script crée ou réutilise le profil **`cinek8s-demo`**, avec le namespace **
 bash demo.sh --profile cinek8s-demo-prof
 ```
 
-Chaque commande `kubectl` vise explicitement ce profil ; le contexte habituel est conservé lors du démarrage de Minikube. Les fichiers rendus et `reponses.md` ne sont pas modifiés par le script. Le Compose est dérivé du fichier fourni, avec uniquement les ports publiés adaptés. Les variantes volontairement cassées de ticket-debug restent dans le dossier de rapport.
+Chaque commande `kubectl` vise explicitement ce profil et le kubeconfig de cette exécution, stocké dans `reports/AAAAMMJJ-HHMMSS-PID/kubeconfig`. Minikube reçoit ce même chemin via `KUBECONFIG`, uniquement dans le processus du script et ses enfants. Le fichier `~/.kube/config` et les kubeconfigs habituels de l'utilisateur ne sont pas modifiés par la démonstration. Les fichiers rendus et `reponses.md` ne sont pas modifiés par le script. Le Compose est dérivé du fichier fourni, avec uniquement les ports publiés adaptés. Les variantes volontairement cassées de ticket-debug restent dans le dossier de rapport.
+
+Le script n'exécute aucune commande `sudo`, `sysctl`, `ulimit`, installation de paquets ou modification de `/etc/hosts`, du pare-feu, des fichiers de démarrage du shell ou des réglages Docker Desktop. Les services Java locaux, les ports Compose et les port-forwards écoutent sur `127.0.0.1`. Il crée cependant des ressources de travail : sorties Maven dans `target/`, caches Maven/Minikube, images Docker `movie-service:1.0.0` et `ticket-service:1.0.0`, réseau et conteneurs Compose, cluster et rapports. Ces tags Docker sont reconstruits s'ils existent déjà. Le profil de démonstration est réservé à l'examen : ses Pods et leurs données sont remplacés pendant les tests.
 
 À la fin, les processus Java locaux, les port-forwards et le projet Compose de démonstration sont arrêtés. Le cluster reste disponible pour inspection. Si le script échoue pendant la panne à zéro réplica, il tente de restaurer movie à deux réplicas ; les diagnostics et le résultat de cette restauration restent dans le rapport.
 
 Pour inspecter le cluster et rouvrir l'accès HTTP :
 
+Remplacer `AAAAMMJJ-HHMMSS-PID` par le dossier affiché à la fin du script :
+
 ```bash
-kubectl --context cinek8s-demo -n cinema-exam get pods
-kubectl --context cinek8s-demo -n ingress-nginx port-forward --address 127.0.0.1 svc/ingress-nginx-controller 18080:80
+kubectl --kubeconfig reports/AAAAMMJJ-HHMMSS-PID/kubeconfig --context cinek8s-demo -n cinema-exam get pods
+kubectl --kubeconfig reports/AAAAMMJJ-HHMMSS-PID/kubeconfig --context cinek8s-demo -n ingress-nginx port-forward --address 127.0.0.1 svc/ingress-nginx-controller 18080:80
 ```
 
 Dans un autre terminal :
@@ -102,7 +108,7 @@ curl --noproxy '*' -H 'Host: cinema.local' http://127.0.0.1:18080/api/movies
 Pour supprimer le cluster de démonstration après inspection :
 
 ```bash
-minikube delete -p cinek8s-demo
+KUBECONFIG=reports/AAAAMMJJ-HHMMSS-PID/kubeconfig minikube delete -p cinek8s-demo
 ```
 
 ## Vérifier le script sans déployer
@@ -153,7 +159,7 @@ Le **9 octobre 2026**, la démonstration complète a réussi dans l'environnemen
 
 Les preuves de cette exécution sont dans `reports/linux/20261009-004917-44/`. Les empreintes SHA-256 identifient la version des trois scripts exécutés. Les rapports sont exclus de Git ; chaque nouvelle exécution produit ses propres preuves. Cette validation porte sur Ubuntu amd64 ; aucune exécution macOS n'a été réalisée.
 
-Un essai ultérieur sur une VM Ubuntu 26.04 a réussi les 40 premières vérifications, puis dépassé le délai d'attente de movie. Les événements Kubernetes montrent cinq redémarrages provoqués par la sonde de démarrage de 60 secondes ; les deux Pods sont finalement devenus prêts. Les budgets des sondes, le démarrage successif des services, les diagnostics et la durée d'observation du rollout ont été adaptés après cet essai. **Le résultat de 123 vérifications ci-dessus concerne la version précédente : une nouvelle exécution complète sur cette VM est nécessaire pour valider ces corrections avant commit.**
+Un essai ultérieur sur une VM Ubuntu 26.04 a réussi les 40 premières vérifications, puis dépassé le délai d'attente de movie. Les événements Kubernetes montrent cinq redémarrages provoqués par la sonde de démarrage de 60 secondes ; les deux Pods sont finalement devenus prêts. Les budgets des sondes, le démarrage successif des services, les diagnostics et la durée d'observation du rollout ont été adaptés après cet essai. **Le résultat de 123 vérifications ci-dessus concerne la version précédente : une nouvelle exécution complète sur cette VM est nécessaire pour valider les corrections. Le commit permet de les récupérer sur la VM avec `git pull` ; il ne constitue pas une validation complète.**
 
 ## Validation complète sur Linux depuis GitHub
 

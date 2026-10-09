@@ -86,6 +86,7 @@ run docker compose version
 run minikube version
 run kubectl version --client
 if [ "$CHECK_ONLY" -eq 1 ]; then log 'Prerequis verifies. Aucun deploiement effectue.'; exit 0; fi
+prepare_kubeconfig
 
 section 'Partie 1 — configuration et lecture du code'
 check 'Readiness ticket dependante de movie' grep -Eq 'include:[[:space:]]*readinessState,[[:space:]]*movie' ticket-service/src/main/resources/application.yaml
@@ -102,10 +103,10 @@ for service in movie-service ticket-service; do
     tests_run=$( { grep -h -o '<testcase' "$RUN_DIR/tests-$service/"*.xml || true; } | wc -l | tr -d ' ')
     check "Au moins un test Maven execute : $service ($tests_run)" test "$tests_run" -gt 0
 done
-SERVER_PORT="$MOVIE_PORT" MOVIE_ENVIRONMENT=local java -jar movie-service/target/movie-service-1.0.0.jar > "$RUN_DIR/movie-local.log" 2>&1 &
+SERVER_ADDRESS=127.0.0.1 SERVER_PORT="$MOVIE_PORT" MOVIE_ENVIRONMENT=local java -jar movie-service/target/movie-service-1.0.0.jar > "$RUN_DIR/movie-local.log" 2>&1 &
 MOVIE_PID=$!
 wait_http "$MOVIE_URL/actuator/health/liveness" 200 'Movie local demarre'
-SERVER_PORT="$TICKET_PORT" MOVIE_URL="$MOVIE_URL" java -jar ticket-service/target/ticket-service-1.0.0.jar > "$RUN_DIR/ticket-local.log" 2>&1 &
+SERVER_ADDRESS=127.0.0.1 SERVER_PORT="$TICKET_PORT" MOVIE_URL="$MOVIE_URL" java -jar ticket-service/target/ticket-service-1.0.0.jar > "$RUN_DIR/ticket-local.log" 2>&1 &
 TICKET_PID=$!
 wait_http "$TICKET_URL/actuator/health/readiness" 200 'Ticket local pret'
 expect_http 'Environnement local' 200 "$MOVIE_URL/api/movies/whoami"
@@ -153,9 +154,11 @@ COMPOSE_STARTED=0
 
 section 'Partie 4 — Minikube et communication inter-services'
 log "Profil dedie : $PROFILE. Tous les kubectl utilisent explicitement ce contexte."
+log "Kubeconfig de demonstration : $RUN_DIR/kubeconfig. La configuration Kubernetes habituelle est conservee."
 run minikube start -p "$PROFILE" --driver=docker --cpus=2 --memory=4096 --keep-context
 CLUSTER_STARTED=1
 run k --request-timeout=0 wait --for=condition=Ready node --all --timeout=180s
+wait_cluster_network
 run minikube -p "$PROFILE" image load movie-service:1.0.0
 run minikube -p "$PROFILE" image load ticket-service:1.0.0
 run k apply --dry-run=client --validate=strict -f k8s/
@@ -364,6 +367,6 @@ section 'Bilan — toutes les etapes sont terminees'
 expect_http 'Verification HTTP finale' 200 "$INGRESS_URL/api/movies"
 log "Toutes les verifications ont reussi : $PASSED. Les rapports Maven sont aussi conserves."
 log "Le cluster $PROFILE reste disponible pour inspection."
-log "Pour rouvrir l'acces : kubectl --context $PROFILE -n ingress-nginx port-forward --address 127.0.0.1 svc/ingress-nginx-controller $BASE_PORT:80"
+log "Pour rouvrir l'acces : kubectl --kubeconfig \"$RUN_DIR/kubeconfig\" --context $PROFILE -n ingress-nginx port-forward --address 127.0.0.1 svc/ingress-nginx-controller $BASE_PORT:80"
 log "Puis : curl -H 'Host: cinema.local' $INGRESS_URL/api/movies"
-log "Pour supprimer uniquement ce cluster de demonstration : minikube delete -p $PROFILE"
+log "Pour supprimer uniquement ce cluster de demonstration : KUBECONFIG=\"$RUN_DIR/kubeconfig\" minikube delete -p $PROFILE"

@@ -65,8 +65,14 @@ capture() {
     fi
 }
 
-# Le contexte et le namespace sont explicites pour chaque commande Kubernetes.
-k() { kubectl --context "$PROFILE" --request-timeout=20s "$@"; }
+prepare_kubeconfig() {
+    # Un fichier unique evite toute fusion avec la configuration de l'utilisateur.
+    # L'export concerne seulement ce script et ses processus enfants.
+    export KUBECONFIG="$RUN_DIR/kubeconfig"
+}
+
+# Le fichier, le contexte et le namespace sont explicites pour Kubernetes.
+k() { kubectl --kubeconfig "$RUN_DIR/kubeconfig" --context "$PROFILE" --request-timeout=20s "$@"; }
 kn() { k -n cinema-exam "$@"; }
 compose() { docker compose --project-name "$PROFILE" -f "$RUN_DIR/compose.json" "$@"; }
 
@@ -109,6 +115,47 @@ wait_http() {
         sleep 2
     done
     fail "$title" "Delai de 180 secondes depasse ; HTTP $HTTP_CODE."
+}
+
+collect_network_diagnostics() {
+    local component
+    log "Diagnostics du reseau Kubernetes : $RUN_DIR/network-*"
+    k -n kube-system get pods -o wide > "$RUN_DIR/network-pods.txt" 2>&1 || true
+    k -n kube-system describe pods -l 'k8s-app in (kube-dns,kube-proxy)' \
+        > "$RUN_DIR/network-describe.txt" 2>&1 || true
+    k -n kube-system get events --sort-by=.lastTimestamp > "$RUN_DIR/network-events.txt" 2>&1 || true
+    k -n kube-system get service kube-dns -o yaml > "$RUN_DIR/network-dns-service.yaml" 2>&1 || true
+    k -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns -o json \
+        > "$RUN_DIR/network-dns-endpoints.json" 2>&1 || true
+    for component in kube-dns kube-proxy; do
+        k -n kube-system logs -l "k8s-app=$component" --all-containers=true --prefix --tail=100 \
+            > "$RUN_DIR/network-$component-current.log" 2>&1 || true
+        k -n kube-system logs -l "k8s-app=$component" --all-containers=true --prefix --previous --tail=100 \
+            > "$RUN_DIR/network-$component-previous.log" 2>&1 || true
+    done
+    cat "$RUN_DIR/network-pods.txt"
+    tail -n 15 "$RUN_DIR/network-kube-proxy-previous.log"
+}
+
+wait_cluster_network() {
+    local deadline=$((SECONDS + 180))
+    log 'Attente de CoreDNS et kube-proxy prets avant le deploiement...'
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if k -n kube-system get pods -l 'k8s-app in (kube-dns,kube-proxy)' -o json \
+            > "$RUN_DIR/network-status.json" 2>> "$RUN_DIR/commands.log" &&
+            jq -e '
+                any(.items[]; .metadata.labels["k8s-app"] == "kube-dns") and
+                any(.items[]; .metadata.labels["k8s-app"] == "kube-proxy") and
+                all(.items[]; .metadata.deletionTimestamp == null and
+                    any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+            ' "$RUN_DIR/network-status.json" >/dev/null; then
+            record OK 'CoreDNS et kube-proxy prets'
+            return
+        fi
+        sleep 2
+    done
+    collect_network_diagnostics
+    fail 'Reseau Kubernetes non pret' 'Delai de 180 secondes depasse. Consulter network-describe.txt et network-kube-proxy-previous.log.'
 }
 
 collect_pod_diagnostics() {

@@ -56,7 +56,7 @@ Les deux projets ont été compilés avec `.\mvnw.cmd -B package`, dans leurs do
 
 Les fichiers `movie-service-1.0.0.jar` et `ticket-service-1.0.0.jar` ont été produits.
 
-Les fichiers fournis définissent les ports 8085 et 8086. Pour utiliser les ports du README, les services ont été lancés avec `SERVER_PORT=8080` pour movie et `SERVER_PORT=8082` pour ticket ; ticket utilise `MOVIE_URL=http://localhost:8080`.
+Les fichiers fournis définissent les ports 8085 et 8086. Pour utiliser les ports de l’énoncé (examen.md), les services ont été lancés avec `SERVER_PORT=8080` pour movie et `SERVER_PORT=8082` pour ticket ; ticket utilise `MOVIE_URL=http://localhost:8080`.
 
 Réponse observée pour `GET http://localhost:8080/api/movies/whoami` (HTTP 200) :
 
@@ -179,7 +179,7 @@ C'est le comportement voulu : dans Kubernetes, cette panne retirera le Pod du tr
 
 Les deux Dockerfiles utilisent Maven avec un JDK 21 pour compiler, puis un JRE 21 Alpine pour exécuter le JAR. Les tests ont déjà été exécutés en partie 2 ; le build Docker utilise `-DskipTests`.
 
-Le port est fixé à 8080 dans les images avec `ENV SERVER_PORT=8080`, pour utiliser les ports du README avec les fichiers de configuration fournis.
+Le port est fixé à 8080 dans les images avec `ENV SERVER_PORT=8080`, pour utiliser les ports de l’énoncé (examen.md) avec les fichiers de configuration fournis.
 
 Commandes de construction :
 
@@ -309,7 +309,7 @@ NAME       STATUS   ROLES           AGE     VERSION
 minikube   Ready    control-plane   3m18s   v1.37.0
 ```
 
-Les images construites en partie 3 ont été chargées avec l'option C du README :
+Les images construites en partie 3 ont été chargées avec l'option C de l’énoncé (examen.md) :
 
 ```powershell
 minikube image load movie-service:1.0.0
@@ -420,7 +420,7 @@ movie    10.244.0.3:8080,10.244.0.4:8080   5m10s
 ticket   10.244.0.5:8080,10.244.0.6:8080   14s
 ```
 
-Kubernetes signale que l'API Endpoints est dépréciée depuis la version 1.33. La commande du README fonctionne encore ; une vérification des EndpointSlices confirme les deux adresses pour chacun des Services.
+Kubernetes signale que l'API Endpoints est dépréciée depuis la version 1.33. La commande de l’énoncé (examen.md) fonctionne encore ; une vérification des EndpointSlices confirme les deux adresses pour chacun des Services.
 
 La validation globale et l'application du dossier `k8s/` ont réussi :
 

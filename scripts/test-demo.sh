@@ -20,6 +20,32 @@ assert() {
     if "$@"; then printf '[TEST OK] %s\n' "$*"; else printf '[TEST ECHEC] %s\n' "$*" >&2; exit 1; fi
 }
 
+# Simuler un outil qui ecrit sa configuration : seul le fichier de la demo
+# doit recevoir cette ecriture, meme si l'utilisateur avait defini KUBECONFIG.
+(
+    RUN_DIR="$RUN_DIR/kubeconfig-isolation"
+    mkdir -p "$RUN_DIR"
+    printf 'Configuration utilisateur conservee\n' > "$RUN_DIR/user-config"
+    export KUBECONFIG="$RUN_DIR/user-config"
+    prepare_kubeconfig
+    # Fonction invoquee par k, sans lancer un vrai kubectl.
+    # shellcheck disable=SC2329
+    kubectl() {
+        local destination=${KUBECONFIG:-} arg
+        while [ "$#" -gt 0 ]; do
+            arg=$1; shift
+            if [ "$arg" = --kubeconfig ]; then destination=$1; shift; fi
+        done
+        printf 'Configuration de demonstration\n' >> "$destination"
+    }
+    k get pods
+    bash -c 'printf "Ecriture du processus enfant\n" >> "$KUBECONFIG"'
+    assert grep -qx 'Configuration utilisateur conservee' "$RUN_DIR/user-config"
+    assert test "$(wc -l < "$RUN_DIR/user-config")" -eq 1
+    assert grep -q 'Configuration de demonstration' "$RUN_DIR/kubeconfig"
+    assert grep -q 'Ecriture du processus enfant' "$RUN_DIR/kubeconfig"
+)
+
 assert bash -n "$ROOT_DIR/demo.sh"
 assert bash -n "$ROOT_DIR/scripts/demo-lib.sh"
 assert bash "$ROOT_DIR/demo.sh" --help
@@ -72,6 +98,22 @@ if command -v jq >/dev/null; then
     if (expect_json 'JSON avec un etat incorrect' '.status == "UP"'); then
         printf 'Le mauvais etat JSON doit faire echouer le test.\n' >&2; exit 1
     fi
+    # Le noeud Ready ne suffit pas : les deux composants reseau doivent exister
+    # et etre prets avant d'accepter un cluster comme utilisable.
+    network_calls=0
+    k() {
+        network_calls=$((network_calls + 1))
+        case "$network_calls" in
+            1) printf '%s\n' '{"items":[]}' ;;
+            2) printf '%s\n' '{"items":[{"metadata":{"labels":{"k8s-app":"kube-dns"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+            3) printf '%s\n' '{"items":[{"metadata":{"labels":{"k8s-app":"kube-dns"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}},{"metadata":{"labels":{"k8s-app":"kube-proxy"}},"status":{"conditions":[{"type":"Ready","status":"False"}]}}]}' ;;
+            *) printf '%s\n' '{"items":[{"metadata":{"labels":{"k8s-app":"kube-dns"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}},{"metadata":{"labels":{"k8s-app":"kube-proxy"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+        esac
+    }
+    sleep() { :; }
+    wait_cluster_network
+    assert test "$network_calls" -eq 4
+    unset -f sleep
     # Ni un Pod terminating ni un nombre insuffisant de Pods ne doivent
     # etre acceptes comme un deploiement termine.
     pod_calls=0
@@ -89,6 +131,32 @@ if command -v jq >/dev/null; then
     unset -f sleep
 else
     printf '[TEST NON EXECUTE] Tests des expressions JSON : jq absent.\n'
+fi
+
+# Un cluster en panne doit produire un echec et conserver les logs du crash.
+if command -v jq >/dev/null; then
+    network_dir="$RUN_DIR/network-timeout"
+    mkdir -p "$network_dir"
+    network_code=0
+    (
+        RUN_DIR=$network_dir
+        : > "$RUN_DIR/checks.tsv"; : > "$RUN_DIR/commands.log"
+        k() {
+            case "$*" in
+                *'get pods'*'-o json'*)
+                    printf '%s\n' '{"items":[]}'
+                    SECONDS=$((SECONDS + 181)) ;;
+                *'describe pods'*) printf 'State: CrashLoopBackOff\n' ;;
+                *'logs'*'--previous'*) printf 'Previous kube-proxy startup error\n' ;;
+                *) printf 'Network diagnostic simulated\n' ;;
+            esac
+        }
+        sleep() { :; }
+        wait_cluster_network
+    ) > "$network_dir/output.txt" 2>&1 || network_code=$?
+    assert test "$network_code" -eq 1
+    assert grep -q CrashLoopBackOff "$network_dir/network-describe.txt"
+    assert grep -q 'Previous kube-proxy startup error' "$network_dir/network-kube-proxy-previous.log"
 fi
 
 # Un delai depasse doit rester un echec, avec la cause de demarrage et
