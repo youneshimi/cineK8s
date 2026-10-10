@@ -12,7 +12,7 @@ Ce dépôt contient mes réponses aux sept parties de l’examen, les fichiers D
 
 ##  Réponses et fichiers réalisés
 
-Les explications, les commandes et les observations sont dans **[reponses.md](reponses.md)**. L’énoncé original du professeur est conservé dans **[examen.md](examen.md)**.
+Les explications, les commandes et les observations sont dans **[reponses.md](reponses.md)**. L’énoncé original est conservé dans **[examen.md](examen.md)**.
 
 | Partie | Contenu du rendu |
 |---|---|
