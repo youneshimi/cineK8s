@@ -1,4 +1,4 @@
-# CinéK8s — démonstration pour le professeur
+# CinéK8s — démonstration 
 
 Le script `demo.sh` rejoue les parties 1 à 7 et les deux bonus de l’énoncé [examen.md](examen.md), vérifie les résultats attendus et génère un rapport HTML. Les explications de l'examen restent dans `reponses.md`.
 
